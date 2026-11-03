@@ -1,0 +1,34 @@
+"""Basic verification tests for the traffic classification and density monitoring system."""
+import os
+import sqlite3
+from unified_app import setup_database
+
+
+def test_files():
+    required = ["unified_app.py", "launcher.py", "requirements.txt"]
+    missing = [name for name in required if not os.path.exists(name)]
+    assert not missing, f"Missing required files: {missing}"
+
+
+def test_database():
+    setup_database()
+    conn = sqlite3.connect("unified_traffic_database.db")
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    finally:
+        conn.close()
+    assert {"VehicleCounts", "TrafficEvents", "TrafficDensity"} <= tables
+
+
+def main():
+    test_files()
+    test_database()
+    print("Traffic classification and density monitoring system tests passed.")
+
+
+if __name__ == "__main__":
+    main()
