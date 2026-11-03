@@ -16,7 +16,7 @@ from ultralytics import YOLO
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-ATCC_MODEL_PATH = "yolov8n.pt"
+VEHICLE_MODEL_PATH = "yolov8n.pt"
 AUTO_MODEL_PATH = "best.pt"
 DB_PATH = "unified_traffic_database.db"
 
@@ -48,7 +48,7 @@ def get_gpu_info():
     return {"available": False, "type": "CPU", "name": "N/A", "count": 0, "vram": "N/A"}
 
 
-# COCO classes used by ATCC.
+# COCO vehicle classes used by the detector.
 VEHICLE_CLASSES = {
     2: "car",
     3: "motorcycle",
