@@ -12,6 +12,7 @@ import math
 import time
 import sqlite3
 import tempfile
+import textwrap
 from collections import defaultdict
 from datetime import datetime
 
@@ -276,39 +277,243 @@ class VehicleTracker:
         return roi_total, roi_type_counts, roi_objects
 
 
-class TrafficSignalManager:
-    """ATCC traffic-control logic based on detected vehicle counts."""
+PCU_WEIGHTS = {
+    "motorcycle": 0.5,
+    "bike": 0.5,
+    "car": 1.0,
+    "auto": 1.0,
+    "bus": 2.5,
+    "truck": 2.5,
+    "vehicle": 1.0,
+}
 
-    def __init__(self):
+
+class TrafficSignalManager:
+    """ATCC single-approach dynamic traffic-control logic based on PCU queue density."""
+
+    def __init__(self, min_green=15, max_green=60, yellow_time=3):
+        self.min_green = min_green
+        self.max_green = max_green
+        self.yellow_time = yellow_time
         self.signal_state = "normal"
         self.signal_change_time = None
         self.signal_duration = 45
+        self.recommended_green = 30
+        self.current_pcu = 0.0
 
-    def check_traffic_conditions(self, vehicle_counts):
+    @staticmethod
+    def calculate_pcu(counts: dict) -> float:
+        total = 0.0
+        for v_type, cnt in (counts or {}).items():
+            w = PCU_WEIGHTS.get(str(v_type).lower(), 1.0)
+            total += cnt * w
+        return round(total, 1)
+
+    def compute_dynamic_timing(self, roi_counts: dict, density_level: str = "Low") -> dict:
+        """Calculate dynamic green recommendation based on instantaneous PCU load."""
+        pcu = self.calculate_pcu(roi_counts)
+        self.current_pcu = pcu
+        heavy = sum(roi_counts.get(v, 0) for v in HEAVY_VEHICLES)
+        total_veh = sum(roi_counts.values())
+
+        calc_green = int(self.min_green + round(pcu * 2.0))
+        if heavy >= 4:
+            calc_green += 10
+        recommended = max(self.min_green, min(self.max_green, calc_green))
+        self.recommended_green = recommended
+
+        is_priority = (heavy >= 4) or (pcu >= 18.0) or (density_level.lower() == "high")
+        return {
+            "recommended_green": recommended,
+            "pcu_load": pcu,
+            "total_vehicles": total_veh,
+            "heavy_count": heavy,
+            "is_priority": is_priority,
+            "density_level": density_level,
+        }
+
+    def check_traffic_conditions(self, vehicle_counts, roi_counts=None, density_level="Low"):
         current_time = time.time()
+        counts_for_calc = roi_counts if roi_counts is not None else vehicle_counts
+        dyn = self.compute_dynamic_timing(counts_for_calc, density_level)
+
         if self.signal_change_time and current_time - self.signal_change_time < self.signal_duration:
             remaining = int(self.signal_duration - (current_time - self.signal_change_time))
-            return f"Signal Priority Active ({remaining}s remaining)"
+            return f"🟢 Active ({remaining}s rem) | Rec Green: {dyn['recommended_green']}s [PCU: {dyn['pcu_load']}]"
 
         if self.signal_change_time:
             self.signal_state = "normal"
             self.signal_change_time = None
 
-        heavy = sum(vehicle_counts.get(v, 0) for v in HEAVY_VEHICLES)
-        total = sum(vehicle_counts.values())
-
-        if heavy > 5 or total > 15:
+        if dyn["is_priority"]:
             self.signal_state = "priority"
+            self.signal_duration = dyn["recommended_green"]
             self.signal_change_time = current_time
             database.save_traffic_event(
-                "signal_change",
-                f"Heavy vehicles: {heavy}, Total: {total}",
+                "signal_optimization",
+                f"Dynamic Green: {dyn['recommended_green']}s | PCU: {dyn['pcu_load']} | Heavy: {dyn['heavy_count']}",
                 lane="main",
-                trigger_count=total,
+                trigger_count=dyn["total_vehicles"],
             )
-            return f"Signal Priority Active ({self.signal_duration}s) - Heavy: {heavy}, Total: {total}"
+            return f"🚨 Priority Green ({self.signal_duration}s) | PCU: {dyn['pcu_load']}"
 
-        return "Traffic flow normal"
+        return f"🟢 Flow Normal | Rec Green: {dyn['recommended_green']}s [PCU: {dyn['pcu_load']}]"
+
+
+class MultiCameraSignalOptimizer:
+    """Coordinated 3-camera intersection signal timing optimizer."""
+
+    def __init__(self, yellow_time: int = 3, min_green: int = 15, max_green: int = 55):
+        self.yellow_time = yellow_time
+        self.min_green = min_green
+        self.max_green = max_green
+        self.last_switch_time = time.time()
+        self.active_phase_index = 0  # 0: Cam 1, 1: Cam 2, 2: Cam 3
+        self.phase_substate = "green"  # "green" or "yellow"
+        self.current_timings = {}
+        self.last_logged_time = 0
+
+    @staticmethod
+    def calculate_pcu(counts: dict) -> float:
+        total = 0.0
+        for v_type, cnt in (counts or {}).items():
+            w = PCU_WEIGHTS.get(str(v_type).lower(), 1.0)
+            total += cnt * w
+        return round(total, 1)
+
+    def optimize_3way(self, cam1_counts: dict, cam2_counts: dict, cam3_counts: dict) -> dict:
+        """Calculate coordinated dynamic timings for 3 camera footages using Webster PCU model."""
+        pcu1 = self.calculate_pcu(cam1_counts)
+        pcu2 = self.calculate_pcu(cam2_counts)
+        pcu3 = self.calculate_pcu(cam3_counts)
+        total_pcu = round(pcu1 + pcu2 + pcu3, 1)
+
+        if total_pcu <= 12:
+            cycle_time = 60
+        elif total_pcu <= 30:
+            cycle_time = 90
+        else:
+            cycle_time = 120
+
+        total_lost = self.yellow_time * 3
+        total_green = cycle_time - total_lost
+
+        if total_pcu <= 0:
+            base_g = total_green // 3
+            rem = total_green - (base_g * 3)
+            g1, g2, g3 = base_g + rem, base_g, base_g
+        else:
+            raw1 = (pcu1 / total_pcu) * total_green
+            raw2 = (pcu2 / total_pcu) * total_green
+            raw3 = (pcu3 / total_pcu) * total_green
+
+            c1 = max(self.min_green, min(self.max_green, int(round(raw1))))
+            c2 = max(self.min_green, min(self.max_green, int(round(raw2))))
+            c3 = max(self.min_green, min(self.max_green, int(round(raw3))))
+
+            diff = total_green - (c1 + c2 + c3)
+            if diff != 0:
+                highest_idx = 0 if (pcu1 >= pcu2 and pcu1 >= pcu3) else (1 if pcu2 >= pcu3 else 2)
+                if highest_idx == 0 and self.min_green <= c1 + diff <= self.max_green:
+                    c1 += diff
+                elif highest_idx == 1 and self.min_green <= c2 + diff <= self.max_green:
+                    c2 += diff
+                elif highest_idx == 2 and self.min_green <= c3 + diff <= self.max_green:
+                    c3 += diff
+                else:
+                    c1 += diff
+
+            g1, g2, g3 = c1, c2, c3
+
+        heavy1 = sum(cam1_counts.get(v, 0) for v in HEAVY_VEHICLES)
+        heavy2 = sum(cam2_counts.get(v, 0) for v in HEAVY_VEHICLES)
+        heavy3 = sum(cam3_counts.get(v, 0) for v in HEAVY_VEHICLES)
+
+        dominant_cam = "Camera 1"
+        max_pcu = pcu1
+        if pcu2 > max_pcu:
+            dominant_cam = "Camera 2"
+            max_pcu = pcu2
+        if pcu3 > max_pcu:
+            dominant_cam = "Camera 3"
+            max_pcu = pcu3
+
+        cams_sorted = sorted(
+            [("Camera 1", pcu1, g1, heavy1, 0), ("Camera 2", pcu2, g2, heavy2, 1), ("Camera 3", pcu3, g3, heavy3, 2)],
+            key=lambda x: (x[3] >= 4, x[1]),
+            reverse=True,
+        )
+        priority_order = [c[0] for c in cams_sorted]
+
+        now = time.time()
+        elapsed = now - self.last_switch_time
+        assigned_greens = [g1, g2, g3]
+        current_g = assigned_greens[self.active_phase_index]
+
+        if self.phase_substate == "green" and elapsed >= current_g:
+            self.phase_substate = "yellow"
+            self.last_switch_time = now
+            elapsed = 0
+        elif self.phase_substate == "yellow" and elapsed >= self.yellow_time:
+            self.phase_substate = "green"
+            self.active_phase_index = (self.active_phase_index + 1) % 3
+            self.last_switch_time = now
+            elapsed = 0
+
+        cam_names = ["Camera 1", "Camera 2", "Camera 3"]
+        status_dict = {}
+        for idx, (c_name, pcu, grn, hvy, cnts) in enumerate(zip(
+            cam_names,
+            [pcu1, pcu2, pcu3],
+            [g1, g2, g3],
+            [heavy1, heavy2, heavy3],
+            [cam1_counts, cam2_counts, cam3_counts],
+        )):
+            is_active_cam = (idx == self.active_phase_index)
+            if is_active_cam:
+                if self.phase_substate == "green":
+                    light = "GREEN"
+                    rem = max(0, int(grn - elapsed))
+                else:
+                    light = "YELLOW"
+                    rem = max(0, int(self.yellow_time - elapsed))
+            else:
+                light = "RED"
+                if idx > self.active_phase_index:
+                    steps = range(self.active_phase_index, idx)
+                else:
+                    steps = list(range(self.active_phase_index, 3)) + list(range(0, idx))
+                wait = sum(assigned_greens[s] + self.yellow_time for s in steps) - int(elapsed)
+                rem = max(1, wait)
+
+            status_dict[c_name] = {
+                "light": light,
+                "remaining_sec": rem,
+                "rec_green": grn,
+                "pcu_load": pcu,
+                "heavy_count": hvy,
+                "vehicle_count": sum(cnts.values()),
+                "counts_breakdown": dict(cnts),
+                "is_active": is_active_cam,
+            }
+
+        result = {
+            "cycle_time": cycle_time,
+            "total_pcu": total_pcu,
+            "total_green": total_green,
+            "dominant_camera": dominant_cam,
+            "priority_order": priority_order,
+            "active_camera": cam_names[self.active_phase_index],
+            "active_substate": self.phase_substate,
+            "cameras": status_dict,
+        }
+        self.current_timings = result
+
+        if now - self.last_logged_time > 30:
+            database.save_multi_signal_event(cycle_time, status_dict, dominant_camera=dominant_cam, total_pcu=total_pcu)
+            self.last_logged_time = now
+
+        return result
 
 
 def box_iou(box_a, box_b):
@@ -504,7 +709,12 @@ def process_frame(
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
     )
 
-    signal_status = signal_manager.check_traffic_conditions(tracker.counts)
+    signal_status = signal_manager.check_traffic_conditions(
+        tracker.counts,
+        roi_counts=roi_type_counts,
+        density_level=density_level,
+    )
+    dyn_timing = signal_manager.compute_dynamic_timing(roi_type_counts, density_level)
 
     total_vehicles = sum(tracker.counts.values())
     cv2.putText(
@@ -519,9 +729,16 @@ def process_frame(
         )
         y_offset += 22
 
+    rec_grn = dyn_timing["recommended_green"]
+    pcu_val = dyn_timing["pcu_load"]
     cv2.putText(
-        processed, signal_status, (10, h - 20),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+        processed, f"SIGNAL REC: GREEN {rec_grn}s | PCU: {pcu_val}", (10, h - 45),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 128), 2,
+    )
+
+    cv2.putText(
+        processed, signal_status, (10, h - 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
     )
 
     density_info = {
@@ -537,6 +754,7 @@ def process_frame(
         "raw_type_counts": dict(roi_type_counts),
         "badge_color": badge_color,
         "roi_bounds": roi_bounds,
+        "signal_timing": dyn_timing,
     }
 
     return processed, tracker.counts, signal_status, density_info
@@ -880,223 +1098,247 @@ def render_login_view():
 
 def render_live_feeds_view(current_user: dict, is_admin_all_view: bool = False, model_args: dict = None):
     """
-    Render Video Feeds with:
-    - Autoplay and looping
-    - Three-dot hover/click menu: Pause/Resume and Delete
-    - Strict user isolation (Users see only their own feeds; Admins see all)
-    - Live ATCC YOLO detection trigger
+    Sleek Dark CCTV Surveillance Matrix Dashboard (VMS Layout).
+    Inspired by high-end security and traffic monitoring centers:
+    - Left 'Live Monitoring' Camera Hierarchy Drawer
+    - Top Surveillance Bar (Search, Real-time Clock, Grid Switcher, User Badge)
+    - 2x2 Matrix Surveillance Video Grid with live indicators and AI trigger controls
     """
     is_admin_user = current_user.get("role") == "admin"
-    section_title = "🎥 All Live Video Feeds" if (is_admin_user and is_admin_all_view) else "🎥 My Live Video Feeds"
-    st.subheader(section_title)
 
-    # --- Add New Video Feed Section ---
-    with st.expander("➕ Add Live Video Feed (MP4 / RTSP / Stream URL)", expanded=False):
-        with st.form(f"add_feed_form_{'admin' if is_admin_all_view else 'user'}"):
-            f_title = st.text_input("Camera / Feed Title*", placeholder="e.g. Highway Northbound Camera")
-            f_url = st.text_input(
-                "Video Stream / MP4 / RTSP URL*",
-                placeholder="https://example.com/feed.mp4  or  rtsp://camera-ip/stream",
-                help="Supports direct MP4 links, RTSP streams, and local video file paths.",
-            )
-            c_loop, c_status = st.columns(2)
-            with c_loop:
-                f_loop = st.checkbox("Loop Video Continuously", value=True)
-            with c_status:
-                f_status = st.selectbox("Initial Feed Status", ["active", "paused"])
+    # Custom styling matching the dark VMS reference layout
+    st.markdown(
+        """
+        <style>
+        .cctv-card {
+            background-color: #161821;
+            border: 1px solid #232634;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+            margin-bottom: 14px;
+        }
+        .live-dot {
+            height: 9px;
+            width: 9px;
+            background-color: #f97316;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+            box-shadow: 0 0 8px #f97316;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-            target_owner_id = None
-            if is_admin_user:
-                users_list = database.get_all_users()
-                user_options = {f"{u['username']} (ID: {u['id']}, {u['role']})": u["id"] for u in users_list}
-                selected_owner_label = st.selectbox(
-                    "Assign Stream Link To User:*",
-                    list(user_options.keys()),
-                    help="The selected user will be the only standard user who can see and manage this stream link."
-                )
-                target_owner_id = user_options[selected_owner_label]
+    now_dt = datetime.now()
+    now_str = now_dt.strftime("%A %d %B %Y  %H:%M")
 
-            feed_submitted = st.form_submit_button("Add & Assign Live Feed", use_container_width=True)
+    # --- Top Search & Surveillance Header Bar ---
+    top_col_search, top_col_date, top_col_layout, top_col_user = st.columns([3.5, 3.2, 2.3, 2.0])
+    with top_col_search:
+        search_query = st.text_input(
+            "Search",
+            placeholder="🔍 Search Camera (e.g. CCTV 01, Entrance, Highway)...",
+            label_visibility="collapsed",
+            key="vms_search",
+        )
+    with top_col_date:
+        st.markdown(
+            f"""
+            <div style="background:#16171d; border:1px solid #262936; border-radius:8px; padding:7px 12px; color:#cbd5e1; font-size:13px; font-weight:600; display:flex; align-items:center; gap:8px;">
+                <span>📅</span> {now_str}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_col_layout:
+        grid_mode = st.selectbox(
+            "Grid Layout",
+            ["⊞ 2x2 Matrix (4 Feeds)", "▦ 3x3 Matrix (9 Feeds)", "◻ 1x1 Single Focus"],
+            index=0,
+            label_visibility="collapsed",
+            key="vms_grid_mode",
+        )
+    with top_col_user:
+        u_role = current_user.get("role", "operator").capitalize()
+        u_name = current_user.get("username", "Operator")
+        st.markdown(
+            f"""
+            <div style="background:#16171d; border:1px solid #262936; border-radius:8px; padding:7px 12px; color:#f8fafc; font-size:13px; font-weight:bold; display:flex; align-items:center; justify-content:space-between;">
+                <span>🔔</span>
+                <span style="color:#f97316; margin-left:6px;">👤 {u_name}</span>
+                <span style="color:#64748b; font-size:11px;">({u_role})</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        if feed_submitted:
-            ok, msg, new_id = database.add_video_feed(
-                title=f_title,
-                video_url=f_url,
-                current_user=current_user,
-                loop=f_loop,
-                status=f_status,
-                target_user_id=target_owner_id,
-            )
-            if ok:
-                st.success(msg)
-                time.sleep(0.3)
-                st.rerun()
-            else:
-                st.error(msg)
+    # Fetch live feeds according to current search
+    feeds = database.get_video_feeds(current_user, search_query=search_query, status_filter=None)
 
-    # --- Search and Filter Controls ---
-    if is_admin_user:
-        f_col1, f_col2, f_col3 = st.columns([3, 1, 2])
-        with f_col1:
-            search_query = st.text_input("🔍 Search Feeds by Title or URL", placeholder="Type keyword...", label_visibility="collapsed")
-        with f_col2:
-            status_filter = st.selectbox("Status Filter", ["all", "active", "paused"], label_visibility="collapsed")
-        with f_col3:
-            all_users_list = database.get_all_users()
-            user_filter_options = {"All Users (All Streams)": "all"}
-            user_filter_options.update({f"Assigned: {u['username']} (ID: {u['id']})": u["id"] for u in all_users_list})
-            selected_user_filter = st.selectbox("Filter by Assigned User", list(user_filter_options.keys()), label_visibility="collapsed")
-            assigned_user_id = user_filter_options[selected_user_filter]
-    else:
-        f_col1, f_col2 = st.columns([3, 1])
-        with f_col1:
-            search_query = st.text_input("🔍 Search Feeds by Title or URL", placeholder="Type keyword...", label_visibility="collapsed")
-        with f_col2:
-            status_filter = st.selectbox("Status Filter", ["all", "active", "paused"], label_visibility="collapsed")
-        assigned_user_id = None
+    # Two-Column VMS Layout (Left Camera Tree Drawer + Right Video Grid)
+    drawer_col, grid_col = st.columns([1.15, 3.85])
 
-    # Fetch feeds according to authorization rules
-    feeds = database.get_video_feeds(current_user, search_query=search_query, status_filter=status_filter, assigned_user_id=assigned_user_id)
-
-    if not feeds:
-        st.info("No video feeds found. Click '➕ Add Live Video Feed' above to add your first camera feed.")
-        return
-
-    st.markdown(f"**Showing {len(feeds)} camera feed(s)**")
-
-    # Render video cards in 2 columns
-    for idx, feed in enumerate(feeds):
-        fid = feed["id"]
-        status = feed["status"]
-        is_loop = bool(feed["loop"])
-        owner_str = feed.get("owner_username") or f"User #{feed['user_id']}"
+    with drawer_col:
+        st.markdown(
+            """
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px; color:#f97316; font-weight:bold; font-size:15px;">
+                <span style="background:#ea580c; color:white; border-radius:8px; padding:4px 8px; font-size:14px;">📹</span>
+                <span style="color:#f8fafc;">Live Monitoring</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         with st.container():
-            # Compact card header: just title + status indicator + actions menu
-            left_col, right_col = st.columns([5, 1])
-            with left_col:
-                dot_color = "#28a745" if status == "active" else "#9e9e9e"
-                st.markdown(
-                    f'<span style="color:{dot_color}; font-size:10px;">&#9679;</span> '
-                    f'<strong style="font-size:15px;">{feed["title"]}</strong>',
-                    unsafe_allow_html=True,
-                )
-            with right_col:
-                # Three-dot popover menu for Pause, Resume, and Delete operations
-                with st.popover("⋮ Actions", use_container_width=True):
-                    st.markdown(f"**{feed['title']}**")
-                    if status == "active":
-                        if st.button("⏸️ Pause Feed", key=f"pause_{fid}", use_container_width=True):
-                            ok, msg = database.pause_video_feed(fid, current_user)
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                    else:
-                        if st.button("▶️ Resume Feed", key=f"resume_{fid}", use_container_width=True):
-                            ok, msg = database.resume_video_feed(fid, current_user)
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
+            st.markdown(
+                """
+                <div style="font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#f97316; font-weight:bold; margin-bottom:6px;">
+                    ● Main Approaches
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-                    new_loop = st.checkbox("🔁 Loop Video", value=is_loop, key=f"loop_chk_{fid}")
-                    if new_loop != is_loop:
-                        database.toggle_loop_video_feed(fid, new_loop, current_user)
+            camera_selection_options = ["Show All in Matrix Grid"]
+            camera_selection_options.extend([f"CCTV 0{i+1}: {f['title']}" for i, f in enumerate(feeds)])
+            sel_cam = st.radio(
+                "Cameras List",
+                camera_selection_options,
+                index=0,
+                label_visibility="collapsed",
+                key="vms_cam_selector",
+            )
+
+            with st.expander("➕ Add Live Camera", expanded=False):
+                with st.form("quick_add_camera_form"):
+                    new_cam_title = st.text_input("Camera Title*", placeholder="e.g. CCTV 04 - East Bound")
+                    new_cam_url = st.text_input(
+                        "Stream URL*",
+                        placeholder="https://youtu.be/... or rtsp://...",
+                        help="Supports YouTube links, RTSP streams, and MP4 URLs.",
+                    )
+                    add_sub = st.form_submit_button("Add Camera", use_container_width=True)
+                if add_sub and new_cam_title and new_cam_url:
+                    ok, msg, _ = database.add_video_feed(
+                        title=new_cam_title,
+                        video_url=new_cam_url,
+                        current_user=current_user,
+                        loop=True,
+                        status="active",
+                    )
+                    if ok:
+                        st.success("Camera added!")
+                        time.sleep(0.3)
                         st.rerun()
+                    else:
+                        st.error(msg)
 
-                    st.markdown("---")
-                    if st.button("🗑️ Delete Feed", key=f"del_{fid}", use_container_width=True):
-                        ok, msg = database.delete_video_feed(fid, current_user)
-                        if ok:
-                            st.warning(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
+    with grid_col:
+        if not feeds:
+            st.info("No active camera feeds. Click '➕ Add Live Camera' on the left to add a feed.")
+            return
 
-                    if is_admin_user:
-                        st.markdown("---")
-                        st.markdown("👤 **Assign Stream to User:**")
-                        all_users_for_assign = database.get_all_users()
-                        assign_opts = {f"{u['username']} (ID: {u['id']})": u["id"] for u in all_users_for_assign}
-                        cur_idx = 0
-                        for u_idx, (u_lbl, uid) in enumerate(assign_opts.items()):
-                            if uid == feed["user_id"]:
-                                cur_idx = u_idx
-                                break
-                        sel_user_choice = st.selectbox(
-                            "Choose User:",
-                            list(assign_opts.keys()),
-                            index=cur_idx,
-                            key=f"reassign_sel_{fid}"
-                        )
-                        if st.button("🔗 Reassign Stream", key=f"reassign_btn_{fid}", use_container_width=True):
-                            new_uid = assign_opts[sel_user_choice]
-                            ok, msg = database.assign_video_feed(fid, new_uid, current_user)
-                            if ok:
-                                st.success(msg)
-                                time.sleep(0.3)
-                                st.rerun()
-                            else:
-                                st.error(msg)
+        if sel_cam != "Show All in Matrix Grid":
+            sel_idx = camera_selection_options.index(sel_cam) - 1
+            display_feeds = [feeds[sel_idx]]
+        else:
+            display_feeds = feeds
 
-            # Small video preview (wrapped in a narrow column to reduce display size)
-            if status == "active":
-                preview_col, spacer_col = st.columns([2, 3])
-                with preview_col:
-                    try:
-                        st.video(
-                            feed["video_url"],
-                            autoplay=True,
-                            loop=is_loop,
-                            muted=True,
-                        )
-                    except Exception as exc:
-                        st.caption(f"Preview unavailable: {exc}")
+        if "3x3" in grid_mode:
+            num_cols = 3
+        elif "1x1" in grid_mode or len(display_feeds) == 1:
+            num_cols = 1
+        else:
+            num_cols = 2
 
-                # ATCC YOLO Inference Execution Button
-                with st.expander("⚡ Run ATCC Live Detection on this Stream"):
-                    if st.button(f"Start YOLO Detection ({feed['title']})", key=f"run_yolo_{fid}"):
-                        with st.spinner("Connecting to live video stream..."):
-                            cap, err_msg = get_stream_capture(feed["video_url"])
-                        if not cap or not cap.isOpened():
-                            st.error(
-                                err_msg or (
-                                    f"Unable to open video stream from '{feed['video_url']}'. "
-                                    "Please verify the stream URL is accessible."
-                                )
+        for i in range(0, len(display_feeds), num_cols):
+            row_feeds = display_feeds[i:i + num_cols]
+            cols = st.columns(num_cols)
+            for col_idx, feed in enumerate(row_feeds):
+                fid = feed["id"]
+                cctv_num = i + col_idx + 1
+                status = feed["status"]
+                is_loop = bool(feed["loop"])
+
+                with cols[col_idx]:
+                    with st.container():
+                        try:
+                            st.video(
+                                feed["video_url"],
+                                autoplay=True,
+                                loop=is_loop,
+                                muted=True,
                             )
-                        else:
-                            if model_args:
-                                process_video(
-                                    cap,
-                                    model_args["vehicle_model"],
-                                    model_args["auto_model"],
-                                    conf_thresh=model_args["conf_thresh"],
-                                    auto_conf_thresh=model_args["auto_conf_thresh"],
-                                    iou_thresh=model_args["iou_thresh"],
-                                    img_size=model_args["img_size"],
-                                    device=model_args["device"],
-                                    frame_stride=model_args["frame_stride"],
-                                    roi_bounds=model_args["roi_bounds"],
-                                    low_thresh=model_args["low_thresh"],
-                                    med_thresh=model_args["med_thresh"],
-                                    stop_key=f"stop_{fid}",
-                                )
-            else:
-                st.caption("⏸️ Feed paused — open ⋮ Actions to resume.")
+                        except Exception as exc:
+                            st.error(f"Cannot stream feed: {exc}")
 
-            # Collapsed details section (hidden by default, shown on click)
-            with st.expander("ℹ️ Details", expanded=False):
-                status_label = "🟢 Active" if status == "active" else "⏸️ Paused"
-                owner_label = f"👤 Assigned to: {owner_str}" if is_admin_user else "👤 Assigned to You"
-                loop_label = "🔁 Looping" if is_loop else "No Loop"
-                st.caption(f"{status_label}  |  {owner_label}  |  {loop_label}")
-                st.caption(f"Source: `{feed['video_url']}`  •  Feed ID: `{fid}`")
+                        foot_l, foot_r = st.columns([3.0, 2.0])
+                        with foot_l:
+                            st.markdown(
+                                f"""
+                                <div style="display:flex; align-items:center; margin-top:2px;">
+                                    <span class="live-dot"></span>
+                                    <strong style="color:#f8fafc; font-size:13px; letter-spacing:0.3px;">
+                                        CCTV 0{cctv_num} <span style="color:#64748b;">·</span> <span style="color:#cbd5e1;">{feed['title']}</span>
+                                    </strong>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        with foot_r:
+                            f_actions_col1, f_actions_col2 = st.columns([1, 1])
+                            with f_actions_col1:
+                                with st.popover("⚙️", use_container_width=True):
+                                    st.markdown(f"**CCTV 0{cctv_num} Controls**")
+                                    if status == "active":
+                                        if st.button("⏸️ Pause", key=f"vms_p_{fid}", use_container_width=True):
+                                            database.pause_video_feed(fid, current_user)
+                                            st.rerun()
+                                    else:
+                                        if st.button("▶️ Resume", key=f"vms_r_{fid}", use_container_width=True):
+                                            database.resume_video_feed(fid, current_user)
+                                            st.rerun()
+                                    new_l = st.checkbox("🔁 Loop", value=is_loop, key=f"vms_l_{fid}")
+                                    if new_l != is_loop:
+                                        database.toggle_loop_video_feed(fid, new_l, current_user)
+                                        st.rerun()
+                                    if st.button("🗑️ Delete", key=f"vms_d_{fid}", use_container_width=True):
+                                        ok, msg = database.delete_video_feed(fid, current_user)
+                                        if ok:
+                                            st.success(msg)
+                                            time.sleep(0.3)
+                                            st.rerun()
+                                        else:
+                                            st.error(msg)
+                            with f_actions_col2:
+                                run_ai = st.button("⚡ AI", key=f"vms_ai_{fid}", help="Run ATCC AI Detection & Signal Analysis", use_container_width=True)
 
-            st.divider()
+                        if run_ai:
+                            with st.spinner(f"Connecting AI YOLO Engine to CCTV 0{cctv_num}..."):
+                                cap, err_msg = get_stream_capture(feed["video_url"])
+                            if not cap or not cap.isOpened():
+                                st.error(err_msg or "Unable to open video stream.")
+                            else:
+                                if model_args:
+                                    process_video(
+                                        cap,
+                                        model_args["vehicle_model"],
+                                        model_args["auto_model"],
+                                        conf_thresh=model_args["conf_thresh"],
+                                        auto_conf_thresh=model_args["auto_conf_thresh"],
+                                        iou_thresh=model_args["iou_thresh"],
+                                        img_size=model_args["img_size"],
+                                        device=model_args["device"],
+                                        frame_stride=model_args["frame_stride"],
+                                        roi_bounds=model_args["roi_bounds"],
+                                        low_thresh=model_args["low_thresh"],
+                                        med_thresh=model_args["med_thresh"],
+                                        stop_key=f"stop_{fid}",
+                                    )
+                        st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
 
 
 def render_all_videos_view(current_user: dict, model_args: dict = None):
@@ -1106,30 +1348,59 @@ def render_all_videos_view(current_user: dict, model_args: dict = None):
         return
 
     st.subheader("📹 All Videos Management (Admin)")
-    st.markdown("Full administrative view of all registered video camera feeds across all user accounts.")
+    st.markdown("Full administrative control of all video camera feeds across all user accounts. Deleted feeds are permanently purged from the database and all user accounts.")
 
     feeds = database.get_video_feeds(current_user)
 
     if not feeds:
-        st.info("No video records exist.")
+        st.info("ℹ️ No video records exist in the database. All feeds have been permanently deleted and unassigned from all user accounts.")
+        with st.expander("➕ Register New Video Feed", expanded=True):
+            st.caption("Add a new CCTV or traffic video stream and assign it to an operator.")
+            with st.form("admin_empty_add_feed_form"):
+                col_af1, col_af2 = st.columns(2)
+                with col_af1:
+                    new_cam_title = st.text_input("Camera Title:", placeholder="e.g. CCTV 01 - Main Intersection")
+                with col_af2:
+                    new_cam_url = st.text_input("Stream URL:", placeholder="https://youtu.be/... or rtsp://...")
+
+                all_u = database.get_all_users()
+                user_choices = {f"{u['username']} (ID: {u['id']}, Role: {u['role']})": u["id"] for u in all_u}
+                target_user_id = st.selectbox("Assign Initial Access To User:", list(user_choices.keys()))
+                sel_uid = user_choices[target_user_id]
+
+                add_sub = st.form_submit_button("➕ Register Camera Feed", use_container_width=True)
+                if add_sub and new_cam_title and new_cam_url:
+                    ok, msg, _ = database.add_video_feed(
+                        title=new_cam_title,
+                        video_url=new_cam_url,
+                        current_user=current_user,
+                        loop=True,
+                        status="active",
+                        target_user_id=sel_uid,
+                    )
+                    if ok:
+                        st.success(msg)
+                        time.sleep(0.3)
+                        st.rerun()
+                    else:
+                        st.error(msg)
         return
 
-    # Stream Link Assignment Quick Tool
-    with st.expander("⚡ Assign / Transfer Stream Link to User Account", expanded=True):
-        st.caption("Admin can assign any video stream link directly to any user. That user will only see the streams assigned to them.")
-        col_st1, col_st2, col_st3 = st.columns([3, 3, 2])
-        with col_st1:
-            feed_choices = {f"#{f['id']}: {f['title']} (Assigned to: {f.get('owner_username') or f['user_id']})": f["id"] for f in feeds}
+    # Two Management Expanders: Assign Feeds and Delete Feeds
+    col_mgmt1, col_mgmt2 = st.columns(2)
+
+    with col_mgmt1:
+        with st.expander("⚡ Assign / Transfer Stream Link to User Account", expanded=True):
+            st.caption("Admin can assign any video stream link directly to any user. That user will only see the streams assigned to them.")
+            feed_choices = {f"#{f['id']}: {f['title']} (Owner: {f.get('owner_username') or f['user_id']})": f["id"] for f in feeds}
             selected_f_lbl = st.selectbox("Select Stream Link:", list(feed_choices.keys()), key="mgr_feed_sel")
             selected_f_id = feed_choices[selected_f_lbl]
-        with col_st2:
+
             all_u = database.get_all_users()
             user_choices = {f"{u['username']} (ID: {u['id']}, Role: {u['role']})": u["id"] for u in all_u}
             selected_u_lbl = st.selectbox("Assign To User Account:", list(user_choices.keys()), key="mgr_user_sel")
             selected_u_id = user_choices[selected_u_lbl]
-        with col_st3:
-            st.write("")
-            st.write("")
+
             if st.button("🔗 Confirm Assignment", use_container_width=True, key="mgr_btn_assign"):
                 ok, msg = database.assign_video_feed(selected_f_id, selected_u_id, current_user)
                 if ok:
@@ -1139,6 +1410,34 @@ def render_all_videos_view(current_user: dict, model_args: dict = None):
                 else:
                     st.error(msg)
 
+    with col_mgmt2:
+        with st.expander("🗑️ Permanently Delete Video Feed", expanded=True):
+            st.caption("Permanently delete a video feed from SQLite database and all user accounts. Deleted feeds will never reappear.")
+            del_feed_choices = {f"#{f['id']}: {f['title']} (Owner: {f.get('owner_username') or f['user_id']})": f["id"] for f in feeds}
+            selected_del_lbl = st.selectbox("Select Feed to Delete:", list(del_feed_choices.keys()), key="mgr_del_feed_sel")
+            selected_del_id = del_feed_choices[selected_del_lbl]
+
+            if st.button("🗑️ Permanently Delete Feed", type="primary", use_container_width=True, key="mgr_btn_del_single"):
+                ok, msg = database.delete_video_feed(selected_del_id, current_user)
+                if ok:
+                    st.success(msg)
+                    time.sleep(0.3)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            with st.popover("⚠️ Purge All Feeds (Danger Zone)", use_container_width=True):
+                st.warning("Permanently delete ALL registered video feeds from the database and remove access for all users!")
+                if st.button("🚨 Confirm Delete ALL Feeds", type="primary", key="mgr_btn_del_all"):
+                    ok, msg = database.delete_all_video_feeds(current_user)
+                    if ok:
+                        st.success(msg)
+                        time.sleep(0.3)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    st.markdown("<br>", unsafe_allow_html=True)
     df_feeds = pd.DataFrame(feeds)
     display_cols = ["id", "title", "user_id", "owner_username", "status", "loop", "video_url", "created_at"]
     available_cols = [c for c in display_cols if c in df_feeds.columns]
@@ -1162,19 +1461,13 @@ def render_admin_dashboard(current_user: dict):
     def _kpi(col, icon, label, value, bg="#1a2744"):
         with col:
             st.markdown(
-                f"""
-                <div style="
-                    background:{bg};
-                    border-radius:12px;
-                    padding:16px 14px 12px 14px;
-                    text-align:center;
-                    border: 1px solid rgba(255,255,255,0.08);
-                ">
+                textwrap.dedent(f"""
+                <div style="background:{bg}; border-radius:12px; padding:16px 14px 12px 14px; text-align:center; border: 1px solid rgba(255,255,255,0.08);">
                     <div style="font-size:28px;">{icon}</div>
                     <div style="font-size:26px; font-weight:900; color:#e6edf3; margin:4px 0 2px 0;">{value}</div>
                     <div style="font-size:11px; color:#8eacc9; text-transform:uppercase; letter-spacing:0.8px;">{label}</div>
                 </div>
-                """,
+                """).strip(),
                 unsafe_allow_html=True,
             )
 
@@ -1197,19 +1490,15 @@ def render_admin_dashboard(current_user: dict):
                 dot = "🟢" if f["status"] == "active" else "⏸️"
                 owner = f.get("owner_username") or f"User #{f['user_id']}"
                 st.markdown(
-                    f"""
-                    <div style="
-                        display:flex; align-items:center; justify-content:space-between;
-                        background:#f8fafc; border-radius:8px; padding:8px 12px; margin-bottom:6px;
-                        border-left: 3px solid {'#28a745' if f['status']=='active' else '#9e9e9e'};
-                    ">
+                    textwrap.dedent(f"""
+                    <div style="display:flex; align-items:center; justify-content:space-between; background:#f8fafc; border-radius:8px; padding:8px 12px; margin-bottom:6px; border-left: 3px solid {'#28a745' if f['status']=='active' else '#9e9e9e'};">
                         <div>
-                            <span style="font-weight:600; font-size:13px;">{f['title']}</span>
+                            <span style="font-weight:600; font-size:13px; color:#1e293b;">{f['title']}</span>
                             <span style="color:#666; font-size:11px; margin-left:8px;">→ {owner}</span>
                         </div>
                         <span style="font-size:14px;">{dot}</span>
                     </div>
-                    """,
+                    """).strip(),
                     unsafe_allow_html=True,
                 )
         else:
@@ -1278,27 +1567,23 @@ def render_manage_users_view(current_user: dict):
             left, right = st.columns([5, 2])
             with left:
                 st.markdown(
-                    f"""
+                    textwrap.dedent(f"""
                     <div style="display:flex; align-items:center; gap:14px; padding:10px 0;">
-                        <div style="
-                            background:{u_role_color}; color:white; width:42px; height:42px;
-                            border-radius:50%; display:flex; align-items:center; justify-content:center;
-                            font-size:18px; font-weight:bold; flex-shrink:0;
-                        ">{u_avatar}</div>
+                        <div style="background:{u_role_color}; color:white; width:42px; height:42px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:bold; flex-shrink:0;">{u_avatar}</div>
                         <div>
-                            <div style="font-weight:700; font-size:14px;">
+                            <div style="font-weight:700; font-size:14px; color:#f8fafc;">
                                 {u['full_name'] or u['username']}
-                                <code style="font-size:11px; background:#f0f4f8; padding:1px 6px; border-radius:4px; margin-left:6px;">{u['username']}</code>
-                                {'<span style="font-size:11px; color:#aaa; margin-left:6px;">(You)</span>' if is_self else ''}
+                                <span style="font-size:11px; background:#334155; color:#cbd5e1; padding:2px 6px; border-radius:4px; margin-left:6px;">{u['username']}</span>
+                                {'<span style="font-size:11px; color:#94a3b8; margin-left:6px;">(You)</span>' if is_self else ''}
                             </div>
-                            <div style="font-size:12px; color:#666; margin-top:3px;">
+                            <div style="font-size:12px; color:#94a3b8; margin-top:3px;">
                                 📧 {u['email'] or 'No email'} &nbsp;•&nbsp;
                                 <span style="color:{u_role_color}; font-weight:600;">{'🛡️ Admin' if u['role']=='admin' else '👤 User'}</span> &nbsp;•&nbsp;
                                 <span style="color:{u_status_color};">{u_status_icon} {u['status'].capitalize()}</span>
                             </div>
                         </div>
                     </div>
-                    """,
+                    """).strip(),
                     unsafe_allow_html=True,
                 )
             with right:
@@ -1489,6 +1774,463 @@ def render_settings_view(model_args: dict, target_device: str):
                 )
 
 
+def _render_3way_status_ui(result: dict):
+    """Render coordinated 3-way intersection status cards and traffic lights."""
+    cycle_time = result.get("cycle_time", 90)
+    total_pcu = result.get("total_pcu", 0.0)
+    dominant = result.get("dominant_camera", "Camera 1")
+    priority_order = " ➔ ".join(result.get("priority_order", []))
+    cams = result.get("cameras", {})
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(
+            f"""
+            <div style="background:#0f172a; border-radius:10px; padding:12px; text-align:center; border:1px solid #334155;">
+                <div style="font-size:11px; color:#94a3b8; font-weight:bold; letter-spacing:1px;">COORDINATED CYCLE</div>
+                <div style="font-size:24px; font-weight:800; color:#38bdf8; margin-top:2px;">⏱️ {cycle_time}s</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k2:
+        st.markdown(
+            f"""
+            <div style="background:#0f172a; border-radius:10px; padding:12px; text-align:center; border:1px solid #334155;">
+                <div style="font-size:11px; color:#94a3b8; font-weight:bold; letter-spacing:1px;">TOTAL PCU LOAD</div>
+                <div style="font-size:24px; font-weight:800; color:#facc15; margin-top:2px;">🚗 {total_pcu}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k3:
+        st.markdown(
+            f"""
+            <div style="background:#0f172a; border-radius:10px; padding:12px; text-align:center; border:1px solid #334155;">
+                <div style="font-size:11px; color:#94a3b8; font-weight:bold; letter-spacing:1px;">DOMINANT APPROACH</div>
+                <div style="font-size:22px; font-weight:800; color:#f87171; margin-top:2px;">🚨 {dominant}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k4:
+        st.markdown(
+            f"""
+            <div style="background:#0f172a; border-radius:10px; padding:12px; text-align:center; border:1px solid #334155;">
+                <div style="font-size:11px; color:#94a3b8; font-weight:bold; letter-spacing:1px;">PHASE ROTATION</div>
+                <div style="font-size:13px; font-weight:700; color:#a7f3d0; margin-top:7px;">{priority_order}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    c_cols = st.columns(3)
+    for idx, (cam_name, c_data) in enumerate(cams.items()):
+        light = c_data.get("light", "RED")
+        rem = c_data.get("remaining_sec", 0)
+        rec_g = c_data.get("rec_green", 25)
+        pcu = c_data.get("pcu_load", 0.0)
+        hvy = c_data.get("heavy_count", 0)
+        tot_v = c_data.get("vehicle_count", 0)
+
+        if light == "GREEN":
+            glow_color = "#22c55e"
+            bg_card = "#052e16"
+            light_icon = "🟢"
+            state_text = f"GREEN ACTIVE ({rem}s left)"
+        elif light == "YELLOW":
+            glow_color = "#eab308"
+            bg_card = "#422006"
+            light_icon = "🟡"
+            state_text = f"YELLOW CLEARANCE ({rem}s)"
+        else:
+            glow_color = "#ef4444"
+            bg_card = "#1e1e24"
+            light_icon = "🔴"
+            state_text = f"RED — WAITING ({rem}s)"
+
+        with c_cols[idx]:
+            st.markdown(
+                f"""
+                <div style="
+                    background:{bg_card};
+                    border:2px solid {glow_color};
+                    border-radius:12px;
+                    padding:16px;
+                    text-align:center;
+                    box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+                ">
+                    <div style="font-size:16px; font-weight:bold; color:white;">{cam_name}</div>
+                    <div style="font-size:38px; margin:8px 0;">{light_icon}</div>
+                    <div style="font-size:15px; font-weight:800; color:{glow_color}; letter-spacing:0.5px;">{state_text}</div>
+                    <hr style="border:0; border-top:1px solid rgba(255,255,255,0.15); margin:12px 0;">
+                    <div style="display:flex; justify-content:space-between; font-size:13px; color:#cbd5e1; margin-bottom:4px;">
+                        <span>Recommended Green:</span>
+                        <strong style="color:#4ade80;">{rec_g}s</strong>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:13px; color:#cbd5e1; margin-bottom:4px;">
+                        <span>Instant PCU Demand:</span>
+                        <strong style="color:#fde047;">{pcu} PCU</strong>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:13px; color:#cbd5e1; margin-bottom:4px;">
+                        <span>Heavy Vehicles:</span>
+                        <strong style="color:{'#f87171' if hvy >= 3 else '#cbd5e1'};">{hvy}</strong>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:13px; color:#cbd5e1;">
+                        <span>Queue Count:</span>
+                        <strong>{tot_v} veh</strong>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def run_3way_coordinated_processing(src1, src2, src3, model_args: dict, optimizer: MultiCameraSignalOptimizer):
+    """Run synchronized 3-camera live stream processing with coordinated signal timing and stateful caching on RED."""
+    st.subheader("⚡ Live Intersection Processing")
+
+    ctl_col1, ctl_col2 = st.columns([1.5, 4.5])
+    with ctl_col1:
+        stop_btn = st.button("⏹️ Stop Stream Processing", key="stop_3way_run", use_container_width=True)
+    with ctl_col2:
+        freeze_red_enabled = st.checkbox(
+            "🛑 Freeze Footage on Red Signal (Simulate Stopped Queue & 3x FPS Boost)",
+            value=True,
+            help="When enabled, camera frames on RED freeze in place while preserving PCU queue counts, and resume moving when signal turns GREEN. Skips 66% of YOLO inference load!",
+            key="chk_freeze_red",
+        )
+
+    video_cols = st.columns(3)
+    f_placeholders = [video_cols[0].empty(), video_cols[1].empty(), video_cols[2].empty()]
+    cards_placeholder = st.empty()
+
+    caps = []
+    for s in [src1, src2, src3]:
+        c, _ = get_stream_capture(s)
+        if not c or not c.isOpened():
+            st.error(f"Failed to open video source: '{s}'. Please check path or URL.")
+            for opened in caps:
+                opened.release()
+            return
+        caps.append(c)
+
+    trackers = [VehicleTracker(), VehicleTracker(), VehicleTracker()]
+    sig_managers = [TrafficSignalManager(), TrafficSignalManager(), TrafficSignalManager()]
+
+    frame_stride = model_args.get("frame_stride", 2) if model_args else 2
+    conf = model_args.get("conf_thresh", 0.40) if model_args else 0.40
+    auto_conf = model_args.get("auto_conf_thresh", 0.35) if model_args else 0.35
+    iou = model_args.get("iou_thresh", 0.45) if model_args else 0.45
+    sz = model_args.get("img_size", 480) if model_args else 480
+    dev = model_args.get("device", "cpu") if model_args else "cpu"
+    roi = model_args.get("roi_bounds", (0.20, 0.00, 0.95, 1.00)) if model_args else (0.20, 0.00, 0.95, 1.00)
+    low_th = model_args.get("low_thresh", 4) if model_args else 4
+    med_th = model_args.get("med_thresh", 10) if model_args else 10
+    v_model = model_args.get("vehicle_model") if model_args else None
+    a_model = model_args.get("auto_model") if model_args else None
+
+    # 1. Initialize camera state cache BEFORE the main processing loop
+    camera_cache = {
+        i: {
+            "frame": None,
+            "annotated_frame": None,
+            "counts": {},
+            "density_info": {},
+            "pcu": 0.0,
+            "queue_count": 0,
+            "heavy_count": 0,
+            "initialized": False,
+        }
+        for i in [1, 2, 3]
+    }
+
+    frame_idx = 0
+    cam_names = ["Camera 1", "Camera 2", "Camera 3"]
+
+    try:
+        while all(c.isOpened() for c in caps):
+            if stop_btn:
+                st.info("Stream processing stopped.")
+                break
+
+            frame_idx += 1
+            run_inf = (frame_idx == 1) or (frame_idx % frame_stride == 0)
+
+            # Determine active green camera ID (1, 2, or 3)
+            active_green_camera = optimizer.active_phase_index + 1
+
+            # 2. Process each camera feed with stateful caching
+            for cam_id, cap in enumerate(caps, start=1):
+                idx = cam_id - 1
+                is_green = (active_green_camera == cam_id)
+                needs_init = not camera_cache[cam_id]["initialized"]
+
+                if (not freeze_red_enabled) or is_green or needs_init:
+                    # Camera is GREEN/Yellow or initializing: Read new frame & run YOLO inference
+                    ret, f = cap.read()
+                    if not ret or f is None:
+                        if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ret, f = cap.read()
+
+                    if ret and f is not None:
+                        h, w = f.shape[:2]
+                        if w > 640:
+                            f = cv2.resize(f, (640, int(640 * h / w)))
+
+                        proc, cnts, sig_stat, d_info = process_frame(
+                            f,
+                            v_model,
+                            a_model,
+                            trackers[idx],
+                            sig_managers[idx],
+                            conf_thresh=conf,
+                            auto_conf_thresh=auto_conf,
+                            iou_thresh=iou,
+                            img_size=sz,
+                            device=dev,
+                            run_inference=run_inf,
+                            roi_bounds=roi,
+                            low_thresh=low_th,
+                            med_thresh=med_th,
+                        )
+
+                        cam_pcu = optimizer.calculate_pcu(d_info.get("raw_type_counts", {}))
+                        camera_cache[cam_id]["frame"] = f
+                        camera_cache[cam_id]["annotated_frame"] = proc
+                        camera_cache[cam_id]["counts"] = d_info.get("raw_type_counts", {})
+                        camera_cache[cam_id]["density_info"] = d_info
+                        camera_cache[cam_id]["pcu"] = cam_pcu
+                        camera_cache[cam_id]["queue_count"] = d_info.get("total_vehicles", 0)
+                        camera_cache[cam_id]["heavy_count"] = sum(camera_cache[cam_id]["counts"].get(v, 0) for v in HEAVY_VEHICLES)
+                        camera_cache[cam_id]["initialized"] = True
+                else:
+                    # Camera is on RED: Do NOT call cap.read() or run YOLO inference.
+                    # Preserves last measured PCU & vehicle queue in memory, saving 66% compute load.
+                    pass
+
+            # 3. Pass the cached metrics to Webster Coordination Engine
+            c1_counts = camera_cache[1]["counts"]
+            c2_counts = camera_cache[2]["counts"]
+            c3_counts = camera_cache[3]["counts"]
+            timing_res = optimizer.optimize_3way(c1_counts, c2_counts, c3_counts)
+
+            # 4. Render HUD overlay and stream outputs
+            for cam_id in [1, 2, 3]:
+                idx = cam_id - 1
+                cam_key = cam_names[idx]
+                c_data = timing_res["cameras"][cam_key]
+                light_str = c_data["light"]
+                rem_s = c_data["remaining_sec"]
+                rec_g = c_data["rec_green"]
+
+                base_frame = camera_cache[cam_id]["annotated_frame"]
+                if base_frame is None:
+                    continue
+
+                disp_frame = base_frame.copy()
+
+                # If camera is RED and freeze_red_enabled is active, overlay "RED SIGNAL - QUEUE STOPPED" badge
+                if freeze_red_enabled and light_str == "RED":
+                    cv2.rectangle(disp_frame, (12, 48), (340, 84), (0, 0, 180), -1)
+                    cv2.putText(
+                        disp_frame,
+                        "RED SIGNAL - QUEUE STOPPED",
+                        (20, 73),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.60,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                b_color = (0, 255, 0) if light_str == "GREEN" else ((0, 255, 255) if light_str == "YELLOW" else (0, 0, 255))
+                cv2.putText(
+                    disp_frame,
+                    f"ARM {cam_id}: {light_str} ({rem_s}s) | REC: {rec_g}s",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    b_color,
+                    2,
+                )
+
+                _, jpeg_buf = cv2.imencode(".jpg", disp_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                f_placeholders[idx].image(
+                    jpeg_buf.tobytes(),
+                    caption=f"{cam_names[idx]} | Queue Load: {c_data['pcu_load']} PCU ({c_data['vehicle_count']} veh)",
+                    use_container_width=True,
+                )
+
+            with cards_placeholder.container():
+                _render_3way_status_ui(timing_res)
+
+    finally:
+        for c in caps:
+            c.release()
+
+
+def render_3way_signal_optimizer_view(current_user: dict, model_args: dict = None):
+    """
+    Traffic Signal Optimization and Dynamic Timing Recommendation View.
+    Processes footages from intersection approaches (Camera 1, Camera 2, Camera 3)
+    and dynamically calculates proportional PCU-based green light splits.
+    """
+    st.subheader("🚦 Coordinated Traffic Signal Optimizer")
+    st.markdown(
+        """
+        <div style="background:#1e293b; padding:14px 18px; border-radius:10px; border-left:4px solid #38bdf8; margin-bottom:16px;">
+            <strong style="color:#f8fafc; font-size:15px;">Coordinated Multi-Camera Traffic Control Engine</strong><br>
+            <span style="color:#94a3b8; font-size:13px;">
+                Calculates real-time Passenger Car Unit (PCU) loads across camera footages (Approaches A, B, and C)
+                and dynamically allocates Webster-optimized Green and Clearance times to minimize intersection delay.
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    all_feeds = database.get_video_feeds(current_user)
+    if "signal_optimizer_3way" not in st.session_state:
+        st.session_state.signal_optimizer_3way = MultiCameraSignalOptimizer()
+    optimizer = st.session_state.signal_optimizer_3way
+
+    input_mode = st.radio(
+        "Choose Footages Input Source:",
+        ["⚡ Real-Time Traffic Simulation Demo", "📹 Select from Live Camera Feeds", "📁 Upload Video Footages"],
+        horizontal=True,
+        key="opt_input_mode",
+    )
+
+    if input_mode == "⚡ Real-Time Traffic Simulation Demo":
+        st.markdown(
+            "Test live camera footages demonstrating real-time vehicle arrivals, "
+            "instantaneous PCU calculations, and dynamic phase transitions (🟢 Green ➔ 🟡 Yellow ➔ 🔴 Red)."
+        )
+        sim_col1, sim_col2, sim_col3 = st.columns(3)
+        with sim_col1:
+            cam1_traffic = st.select_slider(
+                "Camera 1 (North Arm)",
+                ["Low (3 veh)", "Medium (8 veh)", "Heavy (18 veh)"],
+                value="Heavy (18 veh)",
+                key="cam1_slider",
+            )
+        with sim_col2:
+            cam2_traffic = st.select_slider(
+                "Camera 2 (East Arm)",
+                ["Low (3 veh)", "Medium (8 veh)", "Heavy (18 veh)"],
+                value="Medium (8 veh)",
+                key="cam2_slider",
+            )
+        with sim_col3:
+            cam3_traffic = st.select_slider(
+                "Camera 3 (South/West Arm)",
+                ["Low (3 veh)", "Medium (8 veh)", "Heavy (18 veh)"],
+                value="Low (3 veh)",
+                key="cam3_slider",
+            )
+
+        traffic_map = {
+            "Low (3 veh)": {"car": 2, "motorcycle": 2, "bus": 0, "truck": 0, "auto": 1},
+            "Medium (8 veh)": {"car": 5, "motorcycle": 4, "bus": 1, "truck": 0, "auto": 2},
+            "Heavy (18 veh)": {"car": 11, "motorcycle": 6, "bus": 3, "truck": 2, "auto": 4},
+        }
+        c1_counts = traffic_map[cam1_traffic]
+        c2_counts = traffic_map[cam2_traffic]
+        c3_counts = traffic_map[cam3_traffic]
+
+        result = optimizer.optimize_3way(c1_counts, c2_counts, c3_counts)
+        _render_3way_status_ui(result)
+
+        if st.button("💾 Log Current Optimization Decision to Database", key="btn_save_sim_opt"):
+            database.save_multi_signal_event(
+                result["cycle_time"],
+                result["cameras"],
+                dominant_camera=result["dominant_camera"],
+                total_pcu=result["total_pcu"],
+            )
+            st.success("Coordinated signal decision successfully logged to SQLite TrafficEvents table!")
+
+    elif input_mode == "📹 Select from Live Camera Feeds":
+        if len(all_feeds) < 3:
+            st.warning(
+                f"You currently have {len(all_feeds)} active feed(s). Camera feeds are required for full intersection control. "
+                "You can add more feeds under 'Live Feeds' or use the 'Upload Video Footages' / 'Simulation Demo' options."
+            )
+        col1, col2, col3 = st.columns(3)
+        feed_opts = {f"{f['title']} (ID: {f['id']})": f["video_url"] for f in all_feeds}
+        opts_keys = list(feed_opts.keys())
+
+        with col1:
+            st.markdown("##### 🎥 Camera 1 (Approach A / North)")
+            sel_1 = st.selectbox("Feed 1", opts_keys, index=0 if len(opts_keys) > 0 else 0, key="sel_cam1")
+        with col2:
+            st.markdown("##### 🎥 Camera 2 (Approach B / East)")
+            sel_2 = st.selectbox("Feed 2", opts_keys, index=min(1, len(opts_keys) - 1) if len(opts_keys) > 0 else 0, key="sel_cam2")
+        with col3:
+            st.markdown("##### 🎥 Camera 3 (Approach C / South-West)")
+            sel_3 = st.selectbox("Feed 3", opts_keys, index=min(2, len(opts_keys) - 1) if len(opts_keys) > 0 else 0, key="sel_cam3")
+
+        if st.button("🚀 Start Coordinated Optimization", key="btn_start_3feeds", use_container_width=True):
+            if len(opts_keys) < 3:
+                st.error("Please select all required camera feeds.")
+            else:
+                url1 = feed_opts[sel_1]
+                url2 = feed_opts[sel_2]
+                url3 = feed_opts[sel_3]
+                run_3way_coordinated_processing(url1, url2, url3, model_args, optimizer)
+
+    elif input_mode == "📁 Upload Video Footages":
+        st.markdown("Upload MP4 / AVI video files for the intersection cameras:")
+        up_col1, up_col2, up_col3 = st.columns(3)
+        with up_col1:
+            st.markdown("##### 🎥 Camera 1 (Approach A)")
+            file1 = st.file_uploader("Footage 1", type=["mp4", "avi", "mov"], key="vid_file_1")
+        with up_col2:
+            st.markdown("##### 🎥 Camera 2 (Approach B)")
+            file2 = st.file_uploader("Footage 2", type=["mp4", "avi", "mov"], key="vid_file_2")
+        with up_col3:
+            st.markdown("##### 🎥 Camera 3 (Approach C)")
+            file3 = st.file_uploader("Footage 3", type=["mp4", "avi", "mov"], key="vid_file_3")
+
+        if file1 and file2 and file3:
+            if st.button("🚀 Analyze Video Footages & Optimize Signal", key="btn_start_3files", use_container_width=True):
+                paths = []
+                import tempfile
+                import os
+                for idx, f in enumerate([file1, file2, file3]):
+                    t_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    t_file.write(f.read())
+                    t_file.close()
+                    paths.append(t_file.name)
+                try:
+                    run_3way_coordinated_processing(paths[0], paths[1], paths[2], model_args, optimizer)
+                finally:
+                    for p in paths:
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+        else:
+            st.info("Please upload all camera video footages to begin.")
+
+    st.divider()
+    st.markdown("#### 📜 Recent Multi-Camera Signal Optimization Events (SQLite)")
+    conn = database.get_db_connection()
+    df_events = pd.read_sql_query(
+        "SELECT timestamp, event_type, description, lane as dominant_arm, trigger_count as total_pcu FROM TrafficEvents "
+        "WHERE event_type IN ('multi_camera_signal_optimization', 'signal_optimization') ORDER BY id DESC LIMIT 15",
+        conn,
+    )
+    conn.close()
+    if not df_events.empty:
+        st.dataframe(df_events, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No multi-camera signal optimization events logged yet.")
+
+
 # -------------------------------------------------------------
 # Main Application Entry Point
 # -------------------------------------------------------------
@@ -1639,16 +2381,18 @@ def main():
     # ---- Navigation Menu ----
     # Admin nav items: (label, icon, key)
     ADMIN_NAV = [
-        ("Dashboard",     "📊", "nav_dashboard"),
-        ("Live Feeds",    "📹", "nav_livefeeds"),
-        ("All Videos",    "🎬", "nav_allvideos"),
-        ("Manage Users",  "👥", "nav_users"),
-        ("Analytics",     "📈", "nav_analytics"),
-        ("Settings",      "⚙️",  "nav_settings"),
+        ("Dashboard",        "📊", "nav_dashboard"),
+        ("Live Feeds",       "📹", "nav_livefeeds"),
+        ("Signal Optimizer", "🚦", "nav_signal_optimizer"),
+        ("All Videos",       "🎬", "nav_allvideos"),
+        ("Manage Users",     "👥", "nav_users"),
+        ("Analytics",        "📈", "nav_analytics"),
+        ("Settings",         "⚙️", "nav_settings"),
     ]
     USER_NAV = [
-        ("My Live Feeds", "📹", "nav_myfeeds"),
-        ("Settings",      "⚙️",  "nav_usettings"),
+        ("My Live Feeds",    "📹", "nav_myfeeds"),
+        ("Signal Optimizer", "🚦", "nav_signal_optimizer"),
+        ("Settings",         "⚙️", "nav_usettings"),
     ]
 
     nav_items = ADMIN_NAV if is_admin_user else USER_NAV
@@ -1670,21 +2414,13 @@ def main():
         # Show the active page highlighted via markdown, then a real clickable button
         if is_active:
             st.sidebar.markdown(
-                f"""
-                <div style="
-                    background:#1e3a5f;
-                    border-left:3px solid #4a90d9;
-                    border-radius:6px;
-                    padding:9px 14px;
-                    margin:2px 0;
-                    display:flex; align-items:center; gap:10px;
-                    pointer-events:none;
-                ">
+                textwrap.dedent(f"""
+                <div style="background:#1e3a5f; border-left:3px solid #4a90d9; border-radius:6px; padding:9px 14px; margin:2px 0; display:flex; align-items:center; gap:10px; pointer-events:none;">
                     <span style="font-size:16px;">{icon}</span>
                     <span style="color:#4a90d9; font-size:13px; font-weight:bold;">{label}</span>
                     <span style="margin-left:auto; color:#4a90d9; font-size:10px;">●</span>
                 </div>
-                """,
+                """).strip(),
                 unsafe_allow_html=True,
             )
         else:
@@ -1764,11 +2500,19 @@ def main():
     # MAIN AREA — Top header bar
     # ----------------------------------------------------------------
     if is_admin_user:
-        nav_icon_map = {"Dashboard": "📊", "Live Feeds": "📹", "All Videos": "🎬",
-                        "Manage Users": "👥", "Analytics": "📈", "Settings": "⚙️"}
+        nav_icon_map = {
+            "Dashboard": "📊",
+            "Live Feeds": "📹",
+            "Signal Optimizer": "🚦",
+            "All Videos": "🎬",
+            "Manage Users": "👥",
+            "Analytics": "📈",
+            "Settings": "⚙️",
+        }
         nav_sub_map = {
             "Dashboard": "System overview, KPIs & audit logs",
             "Live Feeds": "Monitor and manage all live camera streams",
+            "Signal Optimizer": "Coordinated multi-camera intersection timing & Webster PCU optimization",
             "All Videos": "Full admin view & stream assignment",
             "Manage Users": "Create, activate, and manage user accounts",
             "Analytics": "Traffic density & vehicle crossing analytics",
@@ -1776,9 +2520,14 @@ def main():
         }
         header_color = "#1a2744"
     else:
-        nav_icon_map = {"My Live Feeds": "📹", "Settings": "⚙️"}
+        nav_icon_map = {
+            "My Live Feeds": "📹",
+            "Signal Optimizer": "🚦",
+            "Settings": "⚙️",
+        }
         nav_sub_map = {
             "My Live Feeds": "Your assigned camera streams",
+            "Signal Optimizer": "Coordinated multi-camera intersection timing & Webster PCU optimization",
             "Settings": "System configuration & diagnostics",
         }
         header_color = "#0d3b2e"
@@ -1794,6 +2543,8 @@ def main():
         render_admin_dashboard(current_user)
     elif selected_nav in ["Live Feeds", "My Live Feeds"]:
         render_live_feeds_view(current_user, is_admin_all_view=False, model_args=model_args)
+    elif selected_nav == "Signal Optimizer":
+        render_3way_signal_optimizer_view(current_user, model_args=model_args)
     elif selected_nav == "All Videos":
         render_all_videos_view(current_user, model_args=model_args)
     elif selected_nav == "Manage Users":

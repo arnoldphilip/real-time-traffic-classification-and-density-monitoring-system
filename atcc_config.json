@@ -74,6 +74,7 @@
     "admin_dashboard": [
       "Dashboard",
       "Live Feeds",
+      "Signal Optimizer",
       "All Videos",
       "Manage Users",
       "Analytics",
@@ -81,6 +82,7 @@
     ],
     "user_dashboard": [
       "My Live Feeds",
+      "Signal Optimizer",
       "Settings"
     ]
   }

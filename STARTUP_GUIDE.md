@@ -31,6 +31,7 @@ The Streamlit interface normally opens at `http://localhost:8501`.
 
 ```powershell
 python test_system.py
+
 ```
 
 The test confirms that the ATCC files and database tables are available.

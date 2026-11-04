@@ -33,6 +33,7 @@ def main():
     import cv2  # noqa: F401
     import streamlit  # noqa: F401
     import torch  # noqa: F401
+    import yt_dlp  # noqa: F401
 
     print("=" * 55)
     print("ATCC installation verified successfully.")

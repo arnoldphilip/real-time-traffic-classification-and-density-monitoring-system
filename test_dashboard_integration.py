@@ -56,27 +56,20 @@ def test_config_json():
 
 
 def test_videos_json():
-    """Verify videos.json structure and sample entries."""
+    """Verify videos.json structure and validity of entries."""
     assert os.path.exists("videos.json"), "videos.json must exist"
     with open("videos.json", "r", encoding="utf-8") as f:
         vdata = json.load(f)
 
     assert "videos" in vdata
     videos = vdata["videos"]
-    assert len(videos) >= 2
-    v1 = next(v for v in videos if v["id"] == 1)
-    v2 = next(v for v in videos if v["id"] == 2)
-    assert v1["user_id"] == 101
-    assert v1["title"] == "Highway Camera 1"
-    assert v1["video_url"] == "https://example.com/highway1.mp4"
-    assert v1["status"] == "active"
-    assert v1["loop"] is True
-
-    assert v2["user_id"] == 102
-    assert v2["title"] == "City Road Camera"
-    assert v2["video_url"] == "https://example.com/cityroad.mp4"
-    assert v2["status"] == "active"
-    assert v2["loop"] is True
+    for v in videos:
+        assert "id" in v
+        assert "user_id" in v
+        assert "title" in v
+        assert "video_url" in v
+        assert "status" in v
+        assert "loop" in v
     print("[PASS] test_videos_json")
 
 
@@ -254,6 +247,55 @@ def test_activity_logs():
     print("[PASS] test_activity_logs")
 
 
+def test_permanent_video_deletion():
+    """
+    CRITICAL TEST:
+    Verify that when an admin deletes a video feed:
+    1. It is permanently removed from the VideoFeeds SQLite table.
+    2. It is permanently removed from videos.json.
+    3. Standard users can no longer see the feed.
+    4. Subsequent calls to database.init_database() DO NOT resurrect or regenerate the deleted feed.
+    """
+    admin_u = database.get_user_by_id(1)
+    user101 = database.get_user_by_id(101)
+
+    # 1. Add a temporary feed assigned to user101
+    ok_add, _, fid = database.add_video_feed(
+        title="Permanent Deletion Test Feed",
+        video_url="https://youtu.be/test_deletion",
+        current_user=admin_u,
+        target_user_id=101,
+    )
+    assert ok_add is True
+    assert database.get_video_feed_by_id(fid, user101) is not None
+
+    # Check that videos.json was synchronized
+    with open("videos.json", "r", encoding="utf-8") as f:
+        vdata = json.load(f)
+    assert any(v["id"] == fid for v in vdata.get("videos", []))
+
+    # 2. Admin deletes the feed permanently
+    ok_del, _ = database.delete_video_feed(fid, admin_u)
+    assert ok_del is True
+
+    # 3. Verify it is gone from SQLite and from user101
+    assert database.get_video_feed_by_id(fid, user101) is None
+    assert database.get_video_feed_by_id(fid, admin_u) is None
+
+    # 4. Verify it is gone from videos.json
+    with open("videos.json", "r", encoding="utf-8") as f:
+        vdata2 = json.load(f)
+    assert not any(v["id"] == fid for v in vdata2.get("videos", []))
+
+    # 5. Call init_database multiple times and verify feed DOES NOT reappear
+    database.init_database()
+    database.init_database()
+    assert database.get_video_feed_by_id(fid, admin_u) is None
+    assert database.get_video_feed_by_id(fid, user101) is None
+
+    print("[PASS] test_permanent_video_deletion")
+
+
 def run_all_tests():
     print("Running ATCC Dashboard Test Suite...")
     test_config_json()
@@ -263,6 +305,7 @@ def run_all_tests():
     test_strict_video_ownership_isolation()
     test_admin_assign_stream_to_user()
     test_activity_logs()
+    test_permanent_video_deletion()
     print("\nALL ATCC DASHBOARD TESTS PASSED SUCCESSFULLY!")
 
 

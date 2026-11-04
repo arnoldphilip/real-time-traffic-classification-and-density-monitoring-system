@@ -100,6 +100,15 @@ def init_database(db_path: str = DB_PATH):
         )
     """)
 
+    # 7. SystemSettings table for permanent system configuration and initialization locks
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS SystemSettings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT
+        )
+    """)
+
     conn.commit()
 
     # Seed default users if empty
@@ -119,43 +128,86 @@ def init_database(db_path: str = DB_PATH):
         conn.commit()
         log_activity_internal(cursor, 1, "admin", "INITIALIZE", "Database seeded with initial administrative and user accounts")
 
-    # Seed sample video feeds if empty
-    cursor.execute("SELECT COUNT(*) FROM VideoFeeds")
-    feed_count = cursor.fetchone()[0]
-    if feed_count == 0:
-        seed_videos = []
-        # Try loading from videos.json first
-        if os.path.exists(VIDEOS_JSON_PATH):
-            try:
-                with open(VIDEOS_JSON_PATH, "r", encoding="utf-8") as vf:
-                    data = json.load(vf)
-                    for item in data.get("videos", []):
-                        seed_videos.append((
-                            item.get("id"),
-                            item.get("user_id", 101),
-                            item.get("title", "Live Traffic Camera"),
-                            item.get("video_url", ""),
-                            item.get("status", "active"),
-                            1 if item.get("loop", True) else 0,
-                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        ))
-            except Exception as e:
-                print(f"Notice: Failed to load videos.json: {e}")
+    # Seed sample video feeds ONLY on very first initialization.
+    # Once seeded_feeds flag is set in SystemSettings, deleted videos will NEVER reappear even if table is empty.
+    cursor.execute("SELECT value FROM SystemSettings WHERE key = 'feeds_seeded'")
+    seeded_flag = cursor.fetchone()
+    if seeded_flag is None:
+        cursor.execute("SELECT COUNT(*) FROM VideoFeeds")
+        feed_count = cursor.fetchone()[0]
+        if feed_count == 0:
+            seed_videos = []
+            # Try loading from videos.json first
+            if os.path.exists(VIDEOS_JSON_PATH):
+                try:
+                    with open(VIDEOS_JSON_PATH, "r", encoding="utf-8") as vf:
+                        data = json.load(vf)
+                        for item in data.get("videos", []):
+                            seed_videos.append((
+                                item.get("id"),
+                                item.get("user_id", 101),
+                                item.get("title", "Live Traffic Camera"),
+                                item.get("video_url", ""),
+                                item.get("status", "active"),
+                                1 if item.get("loop", True) else 0,
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            ))
+                except Exception as e:
+                    print(f"Notice: Failed to load videos.json: {e}")
 
-        # Fallback default feeds if videos.json empty or failed
-        if not seed_videos:
-            seed_videos = [
-                (1, 101, "Highway Camera 1", "https://example.com/highway1.mp4", "active", 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                (2, 102, "City Road Camera", "https://example.com/cityroad.mp4", "active", 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            ]
+            # Fallback default feeds if videos.json empty or failed
+            if not seed_videos:
+                seed_videos = [
+                    (1, 101, "CCTV 01 - Main Entrance", "https://youtu.be/eO19UTm93GQ", "active", 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    (2, 102, "CCTV 02 - North Road", "https://youtu.be/7LrWGGJFEJo", "active", 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    (3, 101, "CCTV 03 - Intersection South", "https://youtu.be/KBsqQez-O4w", "active", 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                ]
 
-        cursor.executemany("""
-            INSERT INTO VideoFeeds (id, user_id, title, video_url, status, loop, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, seed_videos)
+            cursor.executemany("""
+                INSERT INTO VideoFeeds (id, user_id, title, video_url, status, loop, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, seed_videos)
+            conn.commit()
+
+        # Set permanent lock flag: feeds have been seeded once. Never auto-reseed on empty.
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            INSERT OR REPLACE INTO SystemSettings (key, value, updated_at)
+            VALUES ('feeds_seeded', '1', ?)
+        """, (now_ts,))
         conn.commit()
 
     conn.close()
+
+
+def sync_feeds_to_json(db_path: str = DB_PATH, json_path: str = VIDEOS_JSON_PATH):
+    """
+    Synchronize SQLite VideoFeeds records permanently into videos.json.
+    Ensures that permanent video additions, modifications, and deletions
+    are mirrored in videos.json so deleted videos never resurrect.
+    """
+    try:
+        conn = get_db_connection(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, user_id, title, video_url, status, loop FROM VideoFeeds ORDER BY id ASC")
+        rows = cursor.fetchall()
+        conn.close()
+
+        feed_list = []
+        for r in rows:
+            feed_list.append({
+                "id": r["id"],
+                "user_id": r["user_id"],
+                "title": r["title"],
+                "video_url": r["video_url"],
+                "status": r["status"],
+                "loop": bool(r["loop"]),
+            })
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump({"videos": feed_list}, f, indent=2)
+    except Exception as e:
+        print(f"Notice: Failed to synchronize {json_path}: {e}")
 
 
 def log_activity_internal(cursor: sqlite3.Cursor, user_id: int, username: str, action: str, details: str):
@@ -279,6 +331,7 @@ def delete_user(user_id: int, current_user: dict) -> tuple[bool, str]:
     log_activity_internal(cursor, current_user["id"], current_user["username"], "DELETE_USER", f"Deleted user '{target_user['username']}' (ID: {user_id}) and their video feeds")
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"User '{target_user['username']}' deleted successfully."
 
 
@@ -395,6 +448,7 @@ def add_video_feed(title: str, video_url: str, current_user: dict, loop: bool = 
     log_activity_internal(cursor, current_user["id"], current_user["username"], "ADD_FEED", f"Added video feed '{title}' (ID: {new_id}, Owner: {assigned_user_id})")
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"Video feed '{title}' added successfully.", new_id
 
 
@@ -416,6 +470,7 @@ def pause_video_feed(video_id: int, current_user: dict) -> tuple[bool, str]:
     log_activity_internal(cursor, current_user["id"], current_user["username"], "PAUSE_FEED", f"Paused video feed '{feed['title']}' (ID: {video_id})")
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"Feed '{feed['title']}' paused."
 
 
@@ -437,28 +492,60 @@ def resume_video_feed(video_id: int, current_user: dict) -> tuple[bool, str]:
     log_activity_internal(cursor, current_user["id"], current_user["username"], "RESUME_FEED", f"Resumed video feed '{feed['title']}' (ID: {video_id})")
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"Feed '{feed['title']}' resumed."
 
 
 def delete_video_feed(video_id: int, current_user: dict) -> tuple[bool, str]:
     """
-    Delete a video feed.
+    Permanently delete a video feed from the database and all user accounts.
     Strictly verifies ownership: Admins can delete any feed, users can delete ONLY their own.
+    Synchronizes deletion with videos.json so it never reappears.
     """
     if not current_user:
         return False, "Authentication required."
 
-    feed = get_video_feed_by_id(video_id, current_user)
+    try:
+        vid = int(video_id)
+    except (ValueError, TypeError):
+        return False, f"Invalid video feed ID: {video_id}"
+
+    feed = get_video_feed_by_id(vid, current_user)
     if not feed:
         return False, "Access denied or video feed not found."
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM VideoFeeds WHERE id = ?", (video_id,))
-    log_activity_internal(cursor, current_user["id"], current_user["username"], "DELETE_FEED", f"Deleted video feed '{feed['title']}' (ID: {video_id})")
+    cursor.execute("DELETE FROM VideoFeeds WHERE id = ?", (vid,))
+    log_activity_internal(cursor, current_user["id"], current_user["username"], "DELETE_FEED", f"Permanently deleted video feed '{feed['title']}' (ID: {vid})")
     conn.commit()
     conn.close()
-    return True, f"Feed '{feed['title']}' deleted successfully."
+
+    # Synchronize permanent deletion with videos.json
+    sync_feeds_to_json()
+
+    return True, f"Video feed '{feed['title']}' (ID: {vid}) was permanently deleted from the database and all user accounts."
+
+
+def delete_all_video_feeds(current_user: dict) -> tuple[bool, str]:
+    """
+    Admin only: Permanently delete all video feeds from the database and all user accounts.
+    Synchronizes with videos.json so no feeds reappear.
+    """
+    if not current_user or current_user.get("role") != "admin":
+        return False, "Access denied: Administrator privileges required."
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM VideoFeeds")
+    cnt = cursor.fetchone()[0]
+    cursor.execute("DELETE FROM VideoFeeds")
+    log_activity_internal(cursor, current_user["id"], current_user["username"], "DELETE_ALL_FEEDS", f"Permanently deleted all {cnt} video feeds from database")
+    conn.commit()
+    conn.close()
+
+    sync_feeds_to_json()
+    return True, f"All {cnt} video feed(s) were permanently deleted from the database and all user accounts."
 
 
 def toggle_loop_video_feed(video_id: int, loop: bool, current_user: dict) -> tuple[bool, str]:
@@ -472,6 +559,7 @@ def toggle_loop_video_feed(video_id: int, loop: bool, current_user: dict) -> tup
     cursor.execute("UPDATE VideoFeeds SET loop = ? WHERE id = ?", (1 if loop else 0, video_id))
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"Loop setting updated to {'Enabled' if loop else 'Disabled'}."
 
 
@@ -506,6 +594,7 @@ def assign_video_feed(video_id: int, target_user_id: int, current_user: dict) ->
     )
     conn.commit()
     conn.close()
+    sync_feeds_to_json()
     return True, f"Feed '{row['title']}' assigned to '{target_user['username']}' successfully."
 
 
@@ -576,6 +665,29 @@ def save_traffic_event(event_type: str, description: str, lane: str = "Lane 1", 
     """, (now_str, event_type, description, lane, trigger_count))
     conn.commit()
     conn.close()
+
+
+def save_multi_signal_event(cycle_time: int, cam_timings: dict, dominant_camera: str = "Camera 1", total_pcu: float = 0.0):
+    """Record a coordinated multi-camera traffic signal optimization event."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        desc_parts = [f"Cycle: {cycle_time}s"]
+        for cam_name, c_info in cam_timings.items():
+            g_sec = c_info.get("rec_green", c_info.get("green", 0))
+            p_val = c_info.get("pcu_load", c_info.get("pcu", 0.0))
+            desc_parts.append(f"{cam_name}: {g_sec}s (PCU: {p_val})")
+        description = " | ".join(desc_parts)
+
+        cursor.execute("""
+            INSERT INTO TrafficEvents (timestamp, event_type, description, lane, trigger_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (now_str, "multi_camera_signal_optimization", description, str(dominant_camera), int(total_pcu)))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"Database error saving multi-signal event: {exc}")
 
 
 def save_density_to_database(roi_total: int, density_level: str, roi_type_counts: dict, roi_bounds: tuple):

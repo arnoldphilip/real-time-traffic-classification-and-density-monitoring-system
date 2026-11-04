@@ -23,11 +23,14 @@ def main():
         import streamlit  # noqa: F401
         import cv2  # noqa: F401
         import ultralytics  # noqa: F401
+        import yt_dlp  # noqa: F401
         print("Required packages are available")
     except ImportError as exc:
         print(f"Missing package: {exc}")
-        print("Run: python -m pip install -r requirements.txt")
-        return False
+        print("Installing required dependencies from requirements.txt...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        import yt_dlp  # noqa: F401
+        print("All dependencies successfully installed!")
 
     print("Starting ATCC at http://localhost:8501")
     try:

@@ -11,6 +11,7 @@ def test_files():
 
 
 def test_database():
+    setup_database()
     conn = sqlite3.connect("unified_traffic_database.db")
     tables = {
         row[0] for row in conn.execute(
@@ -21,11 +22,23 @@ def test_database():
     assert "VehicleCounts" in tables
     assert "TrafficEvents" in tables
     assert "TrafficDensity" in tables
+    assert "VideoFeeds" in tables
+    assert "Users" in tables
+    assert "SystemSettings" in tables
+
+
+def test_dependencies():
+    import yt_dlp  # noqa: F401
+    import cv2  # noqa: F401
+    import streamlit  # noqa: F401
+    import pandas  # noqa: F401
+    import bcrypt  # noqa: F401
 
 
 def main():
     test_files()
     test_database()
+    test_dependencies()
     print("ATCC system tests passed.")
 
 
