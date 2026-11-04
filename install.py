@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and verify the traffic classification and density monitoring application."""
+"""Install and verify the ATCC application with GPU support."""
 import os
 import shutil
 import subprocess
@@ -20,7 +20,11 @@ def main():
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
 
     if has_nvidia_gpu():
-        print("NVIDIA GPU hardware detected. Install a compatible PyTorch CUDA build if required.")
+        print("NVIDIA GPU hardware detected! Installing PyTorch CUDA package for GPU speedup...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "torch", "torchvision",
+            "--index-url", "https://download.pytorch.org/whl/cu121"
+        ])
 
     os.makedirs("json", exist_ok=True)
     os.makedirs("output", exist_ok=True)
@@ -30,15 +34,16 @@ def main():
     import streamlit  # noqa: F401
     import torch  # noqa: F401
 
-    print("=" * 70)
-    print("REAL TIME TRAFFIC CLASSIFICATION AND DENSITY MONITORING SYSTEM")
+    print("=" * 55)
+    print("ATCC installation verified successfully.")
     print(f"PyTorch CUDA Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Active GPU: {torch.cuda.get_device_name(0)}")
     print("Run: python launcher.py  OR  streamlit run unified_app.py")
-    print("=" * 70)
+    print("=" * 55)
     return True
 
 
 if __name__ == "__main__":
     raise SystemExit(0 if main() else 1)
+

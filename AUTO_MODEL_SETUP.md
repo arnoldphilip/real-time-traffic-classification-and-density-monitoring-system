@@ -1,15 +1,13 @@
-# Additional Three-Wheeler Detection Model
+# ATCC Auto-Rickshaw Detection
 
-The application uses the standard YOLOv8 detector for car, motorcycle, bus and truck detection. It can additionally load `best.pt` for South-Asian three-wheeler / auto-rickshaw detection.
+The ATCC application keeps the original `yolov8n.pt` detector for car, motorcycle, bus and truck, and additionally loads `best.pt` for South-Asian 3-wheeler detection.
 
-Place the optional `best.pt` file in the project root.
+Place the downloaded model at:
 
-The dedicated model's class `2` (3-wheeler) is displayed and counted as `auto`. When detections from both models overlap, the dedicated auto detection takes precedence to reduce double-counting.
+`ATCC-Infosys-main/best.pt`
 
-Run the application with:
+The dedicated model's class `2` (3-wheeler) is displayed and counted as `auto`. When the two detectors overlap, the dedicated auto detection replaces the original detector's overlapping vehicle detection to avoid double-counting.
 
-```bash
-streamlit run unified_app.py
-```
+Run:
 
-The optional fine-tuned model is not included in this copy because the available GitHub file interface cannot transfer binary model weights. Refer to the upstream repository for the file and its provenance.
+`streamlit run unified_app.py`
