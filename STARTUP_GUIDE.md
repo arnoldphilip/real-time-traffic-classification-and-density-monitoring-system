@@ -1,28 +1,28 @@
-# REAL TIME TRAFFIC CLASSIFICATION AND DENSITY MONITORING SYSTEM — Startup Guide
+# ATCC Startup Guide
 
-## 1. Create and activate a virtual environment
+## 1. Activate the existing virtual environment
 
 ```powershell
-python -m venv venv
+cd <project-directory>
 .\venv\Scripts\Activate.ps1
 ```
 
-## 2. Install dependencies
+## 2. Install dependencies if required
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-## 3. Start the application
-
-```powershell
-python launcher.py
-```
-
-Alternatively:
+## 3. Start ATCC
 
 ```powershell
 streamlit run unified_app.py
+```
+
+Or:
+
+```powershell
+python launcher.py
 ```
 
 The Streamlit interface normally opens at `http://localhost:8501`.
@@ -31,6 +31,7 @@ The Streamlit interface normally opens at `http://localhost:8501`.
 
 ```powershell
 python test_system.py
+
 ```
 
-The basic verification checks required project files and database tables. It is not an end-to-end model-accuracy or live-camera test.
+The test confirms that the ATCC files and database tables are available.

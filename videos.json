@@ -1,0 +1,28 @@
+{
+  "videos": [
+    {
+      "id": 1,
+      "user_id": 1,
+      "title": "Camera 01 - Main Approach (1st)",
+      "video_url": "https://youtu.be/eO19UTm93GQ?si=AB3SRmrZ8xatCw51",
+      "status": "active",
+      "loop": true
+    },
+    {
+      "id": 2,
+      "user_id": 1,
+      "title": "Camera 02 - East Approach (2nd)",
+      "video_url": "https://youtu.be/7LrWGGJFEJo?si=n6Jj0ddniwSLleFk",
+      "status": "active",
+      "loop": true
+    },
+    {
+      "id": 3,
+      "user_id": 1,
+      "title": "Camera 03 - South Approach (3)",
+      "video_url": "https://youtu.be/KBsqQez-O4w?si=WEN7CQu0anNoKt46",
+      "status": "active",
+      "loop": true
+    }
+  ]
+}

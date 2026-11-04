@@ -1,0 +1,142 @@
+================================================================================
+AI VIDEO GENERATION PROMPTS FOR 3-CAMERA COORDINATED TRAFFIC SIGNAL OPTIMIZER
+================================================================================
+Document: ai_video_generation_prompts_for_3camera_optimization.txt
+System: ATCC Real-Time Traffic Classification & Density Monitoring System
+Algorithm Target: 3-Way Webster Proportional PCU Dynamic Green Timing Engine
+================================================================================
+
+1. OVERVIEW & OBJECTIVE
+--------------------------------------------------------------------------------
+To effectively validate and demonstrate the 3-Camera Coordinated Traffic Signal
+Optimization algorithm, you need 3 distinct video footages representing the 3 
+arms of an intersection. 
+
+For the YOLOv8 vehicle detection, centroid tracking, and PCU calculation to work
+optimally, the AI-generated videos must satisfy these surveillance criteria:
+- FIXED CAMERA ANGLE: High-angle static pole-mounted CCTV perspective (no panning,
+  no camera shaking, no zoom).
+- CLEAR VEHICLE MORPHOLOGY: Distinct cars, buses, trucks, and bikes with clear
+  separation and sharp silhouettes.
+- STOP LINE & ROAD LANES: Visible road asphalt, lane markings, and an approach
+  corridor leading up to an intersection stop line.
+
+The 3 videos are structured to trigger the full range of the dynamic algorithm:
+- Camera 1 (Arm A): HEAVY CONGESTION (High PCU -> Triggers Max Green ~50-55s & Priority)
+- Camera 2 (Arm B): MODERATE TRAFFIC (Medium PCU -> Balanced Green ~25-35s)
+- Camera 3 (Arm C): LIGHT / EMPTY FLOW (Low PCU -> Clamped to Minimum Green 15s)
+
+
+================================================================================
+VIDEO 1: CAMERA 1 (APPROACH A / NORTH) — HEAVY TRAFFIC & PRIORITY QUEUE
+================================================================================
+Target PCU Load       : 25.0 - 32.0 PCU (Heavy Queue)
+Vehicle Composition   : 10-14 Cars, 3 Large City Buses, 2 Heavy Trucks, 5 Motorcycles
+Expected Algo Output  : Recommended Green 50s - 55s | Dominant Arm | Priority Phase #1
+
+--- PROMPT (Copy & Paste into Runway Gen-3, Kling AI, Luma Dream Machine, or Sora) ---
+"High-angle static traffic surveillance CCTV camera footage overlooking a heavily 
+congested 4-lane urban intersection approach on a clear sunny day. The camera is 
+mounted high on a roadside traffic pole, pointing down at a 35-degree angle. Long 
+dense queue of slow-moving and idling vehicles waiting at the intersection stop line. 
+Traffic composition includes 3 large public transit city buses, 2 commercial delivery 
+trucks, multiple compact cars and sedans, and several delivery motorcycles filtering 
+between lanes. Realistic asphalt road texture with white painted lane dividers and 
+crosswalk markings. Completely static tripod surveillance shot, zero camera shake, 
+no panning, smooth realistic vehicle motion, security camera aspect ratio, 1080p 
+resolution, 30fps."
+
+--- NEGATIVE PROMPT ---
+"cinematic camera movement, drone flight, shaky camera, zoom, blurry vehicles, distorted 
+wheels, fast forward, unrealistic speed, pedestrian close-up, night time, rain, lens flare"
+
+
+================================================================================
+VIDEO 2: CAMERA 2 (APPROACH B / EAST) — MODERATE STEADY TRAFFIC FLOW
+================================================================================
+Target PCU Load       : 10.0 - 15.0 PCU (Moderate Flow)
+Vehicle Composition   : 5-7 Cars, 2 Auto-Rickshaws / Vans, 3 Motorcycles, 0-1 Bus
+Expected Algo Output  : Recommended Green 25s - 35s | Balanced Phase #2
+
+--- PROMPT (Copy & Paste into Runway Gen-3, Kling AI, Luma Dream Machine, or Sora) ---
+"Overhead fixed security CCTV camera footage capturing a moderate traffic flow along 
+a 3-lane suburban road approaching a traffic intersection. The camera is firmly mounted 
+on a 7-meter utility gantry, static bird's eye perspective looking downward at 30 degrees. 
+A steady moderate stream of vehicles driving at 30 km/h: 6 passenger cars (sedans and 
+SUVs), 2 yellow three-wheeled auto-rickshaws, and 3 commuters on scooters and motorbikes 
+smoothly slowing down near the junction. Crisp road lines, daylight ambiance, realistic 
+traffic pacing. Absolutely zero camera panning or tilt, perfectly steady surveillance 
+feed, high definition 1080p, authentic CCTV realism."
+
+--- NEGATIVE PROMPT ---
+"camera movement, tracking shot, hand-held camera, motion blur, empty road, massive gridlock, 
+cartoonish cars, warped vehicles, dark shadows, lens distortion"
+
+
+================================================================================
+VIDEO 3: CAMERA 3 (APPROACH C / SOUTH-WEST) — LIGHT / FREE-FLOW TRAFFIC
+================================================================================
+Target PCU Load       : 2.0 - 4.5 PCU (Sparse / Free Flow)
+Vehicle Composition   : 1-2 Cars, 1 Motorcycle, mostly clear open road
+Expected Algo Output  : Clamped to Minimum Green 15s (Eliminating wasted green time)
+
+--- PROMPT (Copy & Paste into Runway Gen-3, Kling AI, Luma Dream Machine, or Sora) ---
+"High-mounted outdoor municipal surveillance camera view of an open 3-lane intersection 
+approach with very light and sparse traffic. Fixed pole perspective looking straight 
+down the road toward the intersection at a 25-degree downward angle. Clear open asphalt 
+highway with only 2 standard sedan cars cruising freely and one lone motorcycle in the 
+distance. No traffic congestion, empty road spaces clearly visible between vehicles, 
+bright daylight, sharp painted asphalt markings, clean curb. Completely static camera 
+framing with no movement, steady surveillance video, photorealistic 1080p."
+
+--- NEGATIVE PROMPT ---
+"heavy traffic, traffic jam, buses, trucks, camera shake, zoom, tilt, panning, dramatic lighting, 
+artistic blur, cinematic hyperlapse"
+
+
+================================================================================
+RECOMMENDED AI VIDEO GENERATION PLATFORMS & SETTINGS
+================================================================================
+1. Kling AI (klingai.com):
+   - Model: Kling 1.5 or 2.0 (High Quality mode)
+   - Mode: Text-to-Video
+   - Duration: 5s or 10s (generate 2-3 clips and concatenate, or set to loop)
+   - Camera Control: Set Camera Movement to "Static" / None.
+
+2. Runway Gen-3 Alpha (runwayml.com):
+   - Mode: Text to Video
+   - Motion: Set Motion scale to 3 or 4 (moderate, steady vehicle movement)
+   - Camera Motion: Disable all camera paths (keep fixed).
+
+3. Luma Dream Machine (lumalabs.ai/dream-machine):
+   - Append to prompt: "static tripod CCTV perspective, fixed angle, photorealistic security camera"
+
+4. Pika Labs (pika.art) / Sora:
+   - Parameters: `-camera zoom none -camera pan none -camera tilt none -fps 30`
+
+
+================================================================================
+HOW TO LOAD THE 3 AI VIDEOS INTO THE SYSTEM
+================================================================================
+Method A: Direct 3-Video Upload (Fastest)
+   1. Start ATCC:
+      streamlit run unified_app.py
+   2. Navigate to "🚦 Signal Optimizer" in the sidebar.
+   3. Choose "📁 Upload 3 Video Footages".
+   4. Upload:
+      - Video 1 (Heavy) -> Footage 1
+      - Video 2 (Moderate) -> Footage 2
+      - Video 3 (Light) -> Footage 3
+   5. Click "🚀 Analyze 3 Video Footages & Optimize Signal".
+   6. Watch the algorithm dynamically compute the PCU loads and assign:
+      - Cam 1: 52s Green (Priority Active)
+      - Cam 2: 28s Green
+      - Cam 3: 15s Green (Minimum baseline)
+
+Method B: Live Feeds Matrix Integration
+   1. Place the generated MP4 files in your project or upload to any video host / YouTube.
+   2. Under "📹 Live Feeds", click "➕ Add Live Camera".
+   3. Add all 3 feeds.
+   4. Open "🚦 Signal Optimizer", select "📹 Select from Live Camera Feeds", and run!
+================================================================================
+

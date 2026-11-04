@@ -1,0 +1,21 @@
+{
+  "videos": [
+    {
+      "id": 1,
+      "user_id": 101,
+      "title": "Highway Camera 1",
+      "video_url": "https://example.com/highway1.mp4",
+      "status": "active",
+      "loop": true
+    },
+    {
+      "id": 2,
+      "user_id": 102,
+      "title": "City Road Camera",
+      "video_url": "https://example.com/cityroad.mp4",
+      "status": "active",
+      "loop": true
+    }
+  ]
+}
+

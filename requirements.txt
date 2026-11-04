@@ -8,3 +8,5 @@ torchvision
 matplotlib
 pandas
 scipy
+bcrypt
+yt-dlp

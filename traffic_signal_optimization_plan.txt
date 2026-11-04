@@ -1,0 +1,120 @@
+================================================================================
+ATCC 3-CAMERA TRAFFIC SIGNAL OPTIMIZATION & DYNAMIC TIMING RECOMMENDATION PLAN
+================================================================================
+Document: traffic_signal_optimization_plan.txt
+System: Real-Time Traffic Classification and Density Monitoring System (ATCC)
+Architecture: Multi-Camera Coordinated Intersection Controller (3 Camera Footages)
+Status: Pending Review & Approval Before Deployment
+================================================================================
+
+1. OBJECTIVE & OVERVIEW
+--------------------------------------------------------------------------------
+The objective is to implement a coordinated 3-Camera Traffic Signal Optimization
+and Dynamic Timing Recommendation system. Instead of controlling an isolated lane
+in a silo, the system processes 3 camera footages (representing 3 intersection
+approaches / arms: Camera 1, Camera 2, and Camera 3) and dynamically allocates
+green signal durations proportional to real-time traffic demand.
+
+Core Principles:
+- SIMPLE: Elegant proportional Webster-inspired PCU allocation without heavy overhead.
+- EFFECTIVE: Eliminates green time waste on empty roads and prevents bottlenecking.
+- MULTI-INPUT: Synchronously calculates timing from 3 camera streams or video files.
+
+
+2. MATHEMATICAL FORMULATION (3-CAMERA INTERSECTION)
+--------------------------------------------------------------------------------
+A. Passenger Car Unit (PCU) Weighting per Camera:
+   For each camera i in {1, 2, 3}:
+   - Motorcycle / Bicycle : 0.5 PCU
+   - Car / Auto Rickshaw  : 1.0 PCU
+   - Bus / Truck (Heavy)  : 2.5 PCU
+
+   PCU Load (L_i) = SUM(count_{i, vehicle} * PCU_weight)
+
+B. Coordinated Cycle Time (C):
+   Total Intersection Load (L_total) = L_1 + L_2 + L_3
+
+   Dynamic Cycle Duration:
+   - Light Traffic    (L_total <= 12 PCU)  : C = 60 seconds
+   - Moderate Traffic (13 <= L_total <= 30): C = 90 seconds
+   - Heavy Traffic    (L_total > 30 PCU)   : C = 120 seconds
+
+C. Lost Time & Available Green Time:
+   - Yellow Clearance Time (T_yellow) = 3 seconds per phase
+   - Total Lost Time for 3 phases: L_lost = 3 * 3s = 9 seconds
+   - Available Green Time: G_total = C - L_lost (e.g., 90s - 9s = 81 seconds)
+
+D. Proportional Green Time Allocation:
+   If L_total == 0:
+       G_1 = G_2 = G_3 = G_total / 3  (equal split)
+   Else:
+       Raw Green Time: G_i_raw = G_total * (L_i / L_total)
+       Constrained:    G_i = CLAMP(G_i_raw, T_min, T_max)
+       Where:
+       - Minimum Green (T_min) = 15 seconds (guarantees safe crossing)
+       - Maximum Green (T_max) = 55 seconds (avoids extreme waiting on other arms)
+   
+   * A balancing normalization step guarantees SUM(G_1 + G_2 + G_3) == G_total.
+
+E. Dynamic Phase Priority & Ordering:
+   - The arm with the highest PCU load is served first (Phase 1).
+   - Priority Boost: If an arm has >= 4 heavy vehicles, it receives immediate
+     priority phase assignment and a +5s boost within the cycle.
+
+
+3. SYSTEM ARCHITECTURE & COMPONENTS
+--------------------------------------------------------------------------------
+A. MultiCameraSignalOptimizer (`TrafficSignalManager` extension in `unified_app.py`):
+   - Accepts traffic counts / densities from 3 camera feeds simultaneously:
+     `compute_3way_timing(cam1_counts, cam2_counts, cam3_counts)`
+   - Computes:
+     * Individual PCU loads (L_1, L_2, L_3)
+     * Total cycle time (C) and available green time (G_total)
+     * Recommended green durations (G_1, G_2, G_3)
+     * Recommended phase execution sequence (e.g., Cam 2 -> Cam 1 -> Cam 3)
+     * Active signal state (Green / Yellow / Red countdown for each arm)
+
+B. 3-Camera Intersection Dashboard & Visual HUD:
+   - Add a dedicated "🚦 3-Way Signal Optimizer" interface in Streamlit:
+     * Side-by-side 3 camera view (Camera 1, Camera 2, Camera 3)
+     * Live metrics per camera: Vehicle counts, PCU load, Recommended Green time
+     * Real-time traffic light simulation widget (🔴 / 🟡 / 🟢) showing which camera
+       currently has the active green light and countdown timer.
+     * Intersection KPI banner: Total Intersection PCU, Optimal Cycle Time, Dominant Approach.
+
+C. Multi-Source Input Support:
+   - Option 1: Live Feeds Selection — Select 3 active feeds from existing camera database.
+   - Option 2: 3-Video File Upload / Test Mode — Upload or link 3 video footages
+     for instant synchronized simulation and optimization testing.
+
+D. SQLite Persistence (`database.py`):
+   - Record multi-camera optimization events in `TrafficEvents` with:
+     * Event Type: "multi_signal_optimization"
+     * Description: "Cycle: 90s | Cam1: 36s (11.0 PCU) | Cam2: 26s (7.5 PCU) | Cam3: 19s (5.0 PCU)"
+     * Dominant approach and timestamp.
+
+
+4. IMPLEMENTATION & DEPLOYMENT PHASES
+--------------------------------------------------------------------------------
+Phase 1: Logic Implementation
+         Build `MultiCameraSignalOptimizer` class with PCU weighting, dynamic cycle
+         selection, and proportional Webster green-split algorithms.
+
+Phase 2: Single-Feed Compatibility
+         Ensure existing single-camera live feeds continue functioning smoothly while
+         reporting their individual lane recommendations.
+
+Phase 3: 3-Camera Coordinated UI & Synchronized Pipeline
+         Implement the 3-Camera Intersection view with synchronized frame processing,
+         live 3-way signal cards, and phase transition simulation.
+
+Phase 4: Database & Diagnostic Logging
+         Log multi-approach timing adjustments to SQLite `TrafficEvents` and provide
+         exportable cycle history in Analytics.
+
+Phase 5: Safety & Boundary Verification
+         Test edge cases:
+         - All 3 cameras empty -> Fair equal split (e.g., 27s each in 90s cycle).
+         - 1 camera heavily congested -> Dynamic boost up to maximum 55s.
+         - Heavy vehicle presence -> Priority phase sequencing.
+================================================================================
