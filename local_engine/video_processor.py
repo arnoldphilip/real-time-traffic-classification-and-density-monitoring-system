@@ -84,12 +84,21 @@ class VehicleTracker:
             object_ids = list(self.objects.keys())
             distances = []
             for i, obj in enumerate(object_centroids):
+                pred_vx = obj[2].get("vx", 0.0)
+                pred_vy = obj[2].get("vy", 0.0)
+                pred_cx = obj[0] + pred_vx
+                pred_cy = obj[1] + pred_vy
+                ex_box = obj[2]["bbox"]
+                ex_cls = obj[2].get("class", "vehicle")
+
                 for j, inp in enumerate(input_centroids):
-                    dist = math.hypot(obj[0] - inp[0], obj[1] - inp[1])
-                    ex_box = obj[2]["bbox"]
+                    dist = math.hypot(pred_cx - inp[0], pred_cy - inp[1])
                     cand_box = inp[2]["bbox"]
+                    cand_cls = inp[2].get("class", "vehicle")
                     iou = box_iou(ex_box, cand_box)
                     effective_dist = dist * (1.0 - 0.5 * iou)
+                    if ex_cls != cand_cls:
+                        effective_dist *= 1.25
                     distances.append((effective_dist, i, j))
 
             distances.sort(key=lambda item: item[0])
@@ -99,10 +108,24 @@ class VehicleTracker:
             for distance, object_idx, input_idx in distances:
                 if object_idx in used_objects or input_idx in used_inputs:
                     continue
-                if distance < 75:
+                obj = object_centroids[object_idx]
+                prev_cx, prev_cy = obj[0], obj[1]
+                prev_vx = obj[2].get("vx", 0.0)
+                prev_vy = obj[2].get("vy", 0.0)
+                max_gate = max(80.0, math.hypot(prev_vx, prev_vy) * 2.8)
+
+                if distance < max_gate:
                     object_id = object_ids[object_idx]
                     inp = input_centroids[input_idx]
                     det = dict(inp[2])
+
+                    inst_vx = inp[0] - prev_cx
+                    inst_vy = inp[1] - prev_cy
+                    vx = 0.65 * inst_vx + 0.35 * prev_vx
+                    vy = 0.65 * inst_vy + 0.35 * prev_vy
+                    det["vx"] = vx
+                    det["vy"] = vy
+                    det["track_age"] = obj[2].get("track_age", 0) + 1
 
                     self.class_history[object_id].append(det.get("class", "vehicle"))
                     classes = self.class_history[object_id]
@@ -139,6 +162,9 @@ class VehicleTracker:
             if box_iou(bbox, ex_box) >= 0.35:
                 return
 
+        det["vx"] = 0.0
+        det["vy"] = 0.0
+        det["track_age"] = 1
         self.class_history[self.next_object_id].append(det.get("class", "vehicle"))
         self.objects[self.next_object_id] = (centroid[0], centroid[1], det)
         self.disappeared[self.next_object_id] = 0
@@ -315,6 +341,25 @@ class LocalVideoProcessor:
                                 if class_id not in VEHICLE_CLASSES:
                                     continue
                                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                                bw = x2 - x1
+                                bh = y2 - y1
+                                if bw * bh < 400 or bw < 14 or bh < 14:
+                                    continue
+
+                                # Aspect ratio filter: eliminate tree trunks, poles, horizontal wires
+                                aspect = float(bw) / float(bh)
+                                if aspect < 0.28 or aspect > 4.2:
+                                    continue
+
+                                # Sky exclusion: vehicles cannot drive in sky
+                                if float(y2) <= 0.05 * h:
+                                    continue
+
+                                # Road ROI & Exclusion Zone Filtering: strictly reject houses, trees, sidewalks, buildings
+                                if self.accident_detector is not None and hasattr(self.accident_detector, "road_roi") and self.accident_detector.road_roi is not None:
+                                    if not self.accident_detector.road_roi.bbox_ground_on_road((x1, y1, x2, y2), w, h):
+                                        continue
+
                                 confidence = float(box.conf[0].item())
                                 vehicle_detections.append({
                                     "bbox": (x1, y1, x2, y2),
@@ -341,6 +386,22 @@ class LocalVideoProcessor:
                                 if class_id != 2:
                                     continue
                                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                                bw = x2 - x1
+                                bh = y2 - y1
+                                if bw * bh < 400 or bw < 14 or bh < 14:
+                                    continue
+
+                                aspect = float(bw) / float(bh)
+                                if aspect < 0.28 or aspect > 4.2:
+                                    continue
+
+                                if float(y2) <= 0.05 * h:
+                                    continue
+
+                                if self.accident_detector is not None and hasattr(self.accident_detector, "road_roi") and self.accident_detector.road_roi is not None:
+                                    if not self.accident_detector.road_roi.bbox_ground_on_road((x1, y1, x2, y2), w, h):
+                                        continue
+
                                 confidence = float(box.conf[0].item())
                                 vehicle_detections.append({
                                     "bbox": (x1, y1, x2, y2),
@@ -394,34 +455,76 @@ class LocalVideoProcessor:
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, density_bgr, 2
         )
 
-        # Render tracked vehicle bounding boxes
+        # Accident Detection (Road-aware with active tracks filter, evaluated before box rendering)
+        accidents, suspicious_events = self.accident_detector.update(
+            self.tracker.objects, w, h, frame=frame, disappeared=getattr(self.tracker, "disappeared", None)
+        )
+
+        accident_vehicle_ids = set()
+        accident_vehicle_meta = {}
+        for acc in accidents:
+            for vid in acc.get("vehicle_ids", []):
+                accident_vehicle_ids.add(vid)
+                dmg_info = acc.get("damage_assessment", {}).get(vid, {})
+                accident_vehicle_meta[vid] = {
+                    "conf": acc.get("confidence", "90%"),
+                    "severity": acc.get("severity", "HIGH"),
+                    "damage": dmg_info,
+                }
+
+        suspicious_vehicle_ids = set()
+        for cand in getattr(self.accident_detector, "verifying_candidates", []):
+            for vid in cand.get("vehicles", []):
+                suspicious_vehicle_ids.add(vid)
+
+        # Render tracked vehicle bounding boxes with status color-coding:
+        # 🔴 RED: Confirmed accident | 🟡 YELLOW: Checking/Suspicious | 🟢 GREEN: Normal | 🔵 BLUE: Damage
         for object_id, centroid in self.tracker.objects.items():
             cx, cy, detection = centroid
             x1, y1, x2, y2 = detection["bbox"]
             vehicle_type = detection.get("class", "vehicle")
             confidence = detection.get("confidence", 0.0)
-
             in_roi = object_id in roi_objects
-            color = (255, 0, 255) if vehicle_type == "auto" else ((0, 0, 255) if vehicle_type in HEAVY_VEHICLES else (0, 255, 0))
-            thickness = 3 if in_roi else 2
-            cv2.rectangle(processed, (x1, y1), (x2, y2), color, thickness)
 
-            label = f"#{object_id} {vehicle_type}: {confidence:.2f}"
-            if in_roi:
-                label += " [ROI]"
+            if object_id in accident_vehicle_ids:
+                meta = accident_vehicle_meta.get(object_id, {})
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.rectangle(processed, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2), (255, 255, 255), 1)
 
-            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                dmg = meta.get("damage", {})
+                if dmg.get("damage_detected", False):
+                    cv2.rectangle(processed, (x1 - 2, y1 - 2), (x1 + 18, y1 + 18), (255, 120, 0), 2)
+                    cv2.rectangle(processed, (x2 - 18, y2 - 18), (x2 + 2, y2 + 2), (255, 120, 0), 2)
+
+                label = f"ACCIDENT #{object_id} {vehicle_type.upper()} [{meta.get('conf')}]"
+                tag_color = (0, 0, 200)
+
+            elif object_id in suspicious_vehicle_ids:
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 215, 255), 2)
+                label = f"CHECKING #{object_id} {vehicle_type}"
+                tag_color = (0, 160, 210)
+
+            else:
+                color = (255, 0, 255) if vehicle_type == "auto" else ((0, 0, 255) if vehicle_type in HEAVY_VEHICLES else (0, 255, 0))
+                thickness = 3 if in_roi else 2
+                cv2.rectangle(processed, (x1, y1), (x2, y2), color, thickness)
+                label = f"#{object_id} {vehicle_type}: {confidence:.2f}"
+                if in_roi:
+                    label += " [ROI]"
+                tag_color = color
+
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
             label_y = max(y1, text_size[1] + 10)
             cv2.rectangle(
                 processed,
-                (x1, label_y - text_size[1] - 10),
-                (x1 + text_size[0], label_y),
-                color,
+                (x1, label_y - text_size[1] - 8),
+                (x1 + text_size[0] + 6, label_y),
+                tag_color,
                 -1,
             )
             cv2.putText(
-                processed, label, (x1, label_y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
+                processed, label, (x1 + 3, label_y - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA,
             )
 
         # Counting line
@@ -447,37 +550,22 @@ class LocalVideoProcessor:
             cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 220, 240), 1, cv2.LINE_AA
         )
 
-        # Accident Detection (Road-aware with active tracks filter)
-        accidents, suspicious_events = self.accident_detector.update(
-            self.tracker.objects, w, h, frame=frame, disappeared=getattr(self.tracker, "disappeared", None)
-        )
-
-        # Render Accident Danger Overlays
+        # Render Accident Scene Outline & Top Banner
         for acc in accidents:
             ax1, ay1, ax2, ay2 = acc["bbox"]
             ax1, ay1 = max(0, int(ax1)), max(0, int(ay1))
             ax2, ay2 = min(w - 1, int(ax2)), min(h - 1, int(ay2))
-            cv2.rectangle(processed, (ax1, ay1), (ax2, ay2), (0, 0, 255), 3)
-            cv2.rectangle(processed, (ax1 + 2, ay1 + 2), (ax2 - 2, ay2 - 2), (255, 255, 255), 1)
-
-            vids_tag = ','.join(map(str, acc.get('vehicle_ids', [])))
-            acc_label = f"! HARD ACCIDENT #{vids_tag} [{acc.get('confidence', '90%')}]"
-            text_size = cv2.getTextSize(acc_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
-            label_y = (ay1 - 8) if ay1 > 28 else (ay1 + text_size[1] + 10)
-            label_x = max(4, min(ax1, w - text_size[0] - 12))
-            cv2.rectangle(processed, (label_x - 2, label_y - text_size[1] - 4), (label_x + text_size[0] + 6, label_y + 4), (0, 0, 200), -1)
-            cv2.rectangle(processed, (label_x - 2, label_y - text_size[1] - 4), (label_x + text_size[0] + 6, label_y + 4), (255, 255, 255), 1)
-            cv2.putText(processed, acc_label, (label_x + 2, label_y - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(processed, (ax1, ay1), (ax2, ay2), (0, 0, 180), 1)
 
         if accidents:
-            banner_w = 360
+            sev = accidents[0].get("severity", "HIGH")
+            banner_w = 380
             bx1 = max(10, w // 2 - banner_w // 2)
             bx2 = min(w - 10, bx1 + banner_w)
             cv2.rectangle(processed, (bx1, 8), (bx2, 44), (0, 0, 200), -1)
             cv2.rectangle(processed, (bx1, 8), (bx2, 44), (255, 255, 255), 2)
-            cv2.putText(processed, "!!! HARD ACCIDENT DETECTED !!!", (bx1 + 18, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(processed, f"!!! HARD ACCIDENT [{sev}] DETECTED !!!", (bx1 + 12, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
 
         # FPS calculation
         elapsed = max(0.001, time.time() - t_start)

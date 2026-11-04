@@ -19,6 +19,8 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+from scene_cut import SceneCutDetector
 import torch
 from PIL import Image
 from ultralytics import YOLO
@@ -43,6 +45,16 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 ATCC_MODEL_PATH = "yolov8n.pt"
 AUTO_MODEL_PATH = "best.pt"
+# All frames are scaled to this width before detection/tracking so that every pixel-based threshold
+# (speeds, overlaps, ROI) behaves the same for 480p, 720p, 1080p or 4K sources. 0 = keep native size.
+PROCESS_MAX_WIDTH = 960
+ROAD_TYPE_MODES = {
+    "Auto-detect": "UNKNOWN",
+    "Highway": "HIGHWAY",
+    "City street": "NORMAL_STREET",
+    "Intersection": "INTERSECTION",
+    "Residential road": "RESIDENTIAL_ROAD",
+}
 DB_PATH = database.DB_PATH
 
 
@@ -52,6 +64,16 @@ def setup_database():
 
 
 setup_database()
+
+
+@st.cache_resource
+def _close_stale_accidents_once():
+    """Run once per server start: old unresolved accidents from past sessions
+    must not show DANGER when no video is running."""
+    return database.expire_stale_accident_events()
+
+
+_close_stale_accidents_once()
 
 
 def get_gpu_info():
@@ -156,12 +178,21 @@ class VehicleTracker:
             object_ids = list(self.objects.keys())
             distances = []
             for i, obj in enumerate(object_centroids):
+                pred_vx = obj[2].get("vx", 0.0)
+                pred_vy = obj[2].get("vy", 0.0)
+                pred_cx = obj[0] + pred_vx
+                pred_cy = obj[1] + pred_vy
+                ex_box = obj[2]["bbox"]
+                ex_cls = obj[2].get("class", "vehicle")
+
                 for j, inp in enumerate(input_centroids):
-                    dist = math.hypot(obj[0] - inp[0], obj[1] - inp[1])
-                    ex_box = obj[2]["bbox"]
+                    dist = math.hypot(pred_cx - inp[0], pred_cy - inp[1])
                     cand_box = inp[2]["bbox"]
+                    cand_cls = inp[2].get("class", "vehicle")
                     iou = box_iou(ex_box, cand_box)
                     effective_dist = dist * (1.0 - 0.5 * iou)
+                    if ex_cls != cand_cls:
+                        effective_dist *= 1.25
                     distances.append((effective_dist, i, j))
 
             distances.sort(key=lambda item: item[0])
@@ -171,10 +202,24 @@ class VehicleTracker:
             for distance, object_idx, input_idx in distances:
                 if object_idx in used_objects or input_idx in used_inputs:
                     continue
-                if distance < 75:
+                obj = object_centroids[object_idx]
+                prev_cx, prev_cy = obj[0], obj[1]
+                prev_vx = obj[2].get("vx", 0.0)
+                prev_vy = obj[2].get("vy", 0.0)
+                max_gate = max(80.0, math.hypot(prev_vx, prev_vy) * 2.8)
+
+                if distance < max_gate:
                     object_id = object_ids[object_idx]
                     inp = input_centroids[input_idx]
                     det = dict(inp[2])
+
+                    inst_vx = inp[0] - prev_cx
+                    inst_vy = inp[1] - prev_cy
+                    vx = 0.65 * inst_vx + 0.35 * prev_vx
+                    vy = 0.65 * inst_vy + 0.35 * prev_vy
+                    det["vx"] = vx
+                    det["vy"] = vy
+                    det["track_age"] = obj[2].get("track_age", 0) + 1
 
                     self.class_history[object_id].append(det.get("class", "vehicle"))
                     classes = self.class_history[object_id]
@@ -211,6 +256,9 @@ class VehicleTracker:
             if box_iou(bbox, ex_box) >= 0.35:
                 return
 
+        det["vx"] = 0.0
+        det["vy"] = 0.0
+        det["track_age"] = 1
         self.class_history[self.next_object_id].append(det.get("class", "vehicle"))
         self.objects[self.next_object_id] = (centroid[0], centroid[1], det)
         self.disappeared[self.next_object_id] = 0
@@ -428,6 +476,25 @@ def process_frame(
                             continue
 
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        if bw * bh < 400 or bw < 14 or bh < 14:
+                            continue
+
+                        # Aspect ratio filter: eliminate tree trunks, vertical poles, horizontal wires
+                        aspect = float(bw) / float(bh)
+                        if aspect < 0.28 or aspect > 4.2:
+                            continue
+
+                        # Sky & Horizon exclusion: vehicles cannot drive in sky
+                        if float(y2) <= 0.05 * h:
+                            continue
+
+                        # Road ROI & Exclusion Zone Filtering: strictly reject houses, trees, sidewalks, buildings
+                        if accident_detector is not None and hasattr(accident_detector, "road_roi") and accident_detector.road_roi is not None:
+                            if not accident_detector.road_roi.bbox_ground_on_road((x1, y1, x2, y2), w, h):
+                                continue
+
                         confidence = float(box.conf[0].item())
                         vehicle_type = VEHICLE_CLASSES[class_id]
                         vehicle_detections.append({
@@ -453,6 +520,22 @@ def process_frame(
                             continue
 
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        if bw * bh < 400 or bw < 14 or bh < 14:
+                            continue
+
+                        aspect = float(bw) / float(bh)
+                        if aspect < 0.28 or aspect > 4.2:
+                            continue
+
+                        if float(y2) <= 0.05 * h:
+                            continue
+
+                        if accident_detector is not None and hasattr(accident_detector, "road_roi") and accident_detector.road_roi is not None:
+                            if not accident_detector.road_roi.bbox_ground_on_road((x1, y1, x2, y2), w, h):
+                                continue
+
                         confidence = float(box.conf[0].item())
                         vehicle_detections.append({
                             "bbox": (x1, y1, x2, y2),
@@ -505,33 +588,86 @@ def process_frame(
         cv2.FONT_HERSHEY_SIMPLEX, 0.65, density_bgr, 2
     )
 
+    # --- Accident & Suspicious Traffic Detection (Evaluated before rendering) ---
+    accidents = []
+    suspicious_events = []
+    if accident_detector is not None:
+        accidents, suspicious_events = accident_detector.update(
+            tracker.objects, w, h, frame=frame, disappeared=getattr(tracker, "disappeared", None)
+        )
+
+    # Collect accident-involved vehicle IDs and damage info
+    accident_vehicle_ids = set()
+    accident_vehicle_meta = {}
+    for acc in accidents:
+        for vid in acc.get("vehicle_ids", []):
+            accident_vehicle_ids.add(vid)
+            dmg_info = acc.get("damage_assessment", {}).get(vid, {})
+            accident_vehicle_meta[vid] = {
+                "conf": acc.get("confidence", "90%"),
+                "severity": acc.get("severity", "HIGH"),
+                "damage": dmg_info,
+            }
+
+    # Collect verifying / suspicious vehicle IDs
+    suspicious_vehicle_ids = set()
+    if accident_detector is not None:
+        for cand in getattr(accident_detector, "verifying_candidates", []):
+            for vid in cand.get("vehicles", []):
+                suspicious_vehicle_ids.add(vid)
+
+    # Render tracked vehicles with status color-coding:
+    # 🔴 RED: Confirmed accident | 🟡 YELLOW: Checking/Suspicious | 🟢 GREEN: Normal traffic | 🔵 BLUE: Damage
     for object_id, centroid in tracker.objects.items():
         cx, cy, detection = centroid
         x1, y1, x2, y2 = detection["bbox"]
         vehicle_type = detection.get("class", "vehicle")
         confidence = detection.get("confidence", 0.0)
-
         in_roi = object_id in roi_objects
-        color = (255, 0, 255) if vehicle_type == "auto" else ((0, 0, 255) if vehicle_type in HEAVY_VEHICLES else (0, 255, 0))
-        thickness = 3 if in_roi else 2
-        cv2.rectangle(processed, (x1, y1), (x2, y2), color, thickness)
 
-        label = f"#{object_id} {vehicle_type}: {confidence:.2f}"
-        if in_roi:
-            label += " [ROI]"
+        if object_id in accident_vehicle_ids:
+            # 🔴 Confirmed Accident Vehicle
+            meta = accident_vehicle_meta.get(object_id, {})
+            cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.rectangle(processed, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2), (255, 255, 255), 1)
 
-        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            # 🔵 Blue indicator if physical vehicle damage verified
+            dmg = meta.get("damage", {})
+            if dmg.get("damage_detected", False):
+                cv2.rectangle(processed, (x1 - 2, y1 - 2), (x1 + 18, y1 + 18), (255, 120, 0), 2)
+                cv2.rectangle(processed, (x2 - 18, y2 - 18), (x2 + 2, y2 + 2), (255, 120, 0), 2)
+
+            label = f"ACCIDENT #{object_id} {vehicle_type.upper()} [{meta.get('conf')}]"
+            tag_color = (0, 0, 200)
+
+        elif object_id in suspicious_vehicle_ids:
+            # 🟡 Suspicious / Investigating Interaction
+            cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 215, 255), 2)
+            label = f"CHECKING #{object_id} {vehicle_type}"
+            tag_color = (0, 160, 210)
+
+        else:
+            # 🟢 Normal Vehicles
+            color = (255, 0, 255) if vehicle_type == "auto" else ((0, 0, 255) if vehicle_type in HEAVY_VEHICLES else (0, 255, 0))
+            thickness = 3 if in_roi else 2
+            cv2.rectangle(processed, (x1, y1), (x2, y2), color, thickness)
+            label = f"#{object_id} {vehicle_type}: {confidence:.2f}"
+            if in_roi:
+                label += " [ROI]"
+            tag_color = color
+
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
         label_y = max(y1, text_size[1] + 10)
         cv2.rectangle(
             processed,
-            (x1, label_y - text_size[1] - 10),
-            (x1 + text_size[0], label_y),
-            color,
+            (x1, label_y - text_size[1] - 8),
+            (x1 + text_size[0] + 6, label_y),
+            tag_color,
             -1,
         )
         cv2.putText(
-            processed, label, (x1, label_y - 5),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
+            processed, label, (x1 + 3, label_y - 3),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA,
         )
 
     line_y = int(tracker.counting_line["y"] * h)
@@ -557,51 +693,22 @@ def process_frame(
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 220, 240), 1, cv2.LINE_AA
     )
 
-    # --- Accident & Suspicious Traffic Detection ---
-    accidents = []
-    suspicious_events = []
-    if accident_detector is not None:
-        accidents, suspicious_events = accident_detector.update(
-            tracker.objects, w, h, frame=frame, disappeared=getattr(tracker, "disappeared", None)
-        )
-        
-        # Highlight confirmed accidents with high-visibility red danger bounding box
+    # Secondary Incident Scene Outline & Alert Banner
+    if accidents:
         for acc in accidents:
             ax1, ay1, ax2, ay2 = acc["bbox"]
             ax1, ay1 = max(0, int(ax1)), max(0, int(ay1))
             ax2, ay2 = min(w - 1, int(ax2)), min(h - 1, int(ay2))
-            cv2.rectangle(processed, (ax1, ay1), (ax2, ay2), (0, 0, 255), 3)
-            cv2.rectangle(processed, (ax1 + 2, ay1 + 2), (ax2 - 2, ay2 - 2), (255, 255, 255), 1)
+            cv2.rectangle(processed, (ax1, ay1), (ax2, ay2), (0, 0, 180), 1)
 
-            vids_tag = ','.join(map(str, acc.get('vehicle_ids', [])))
-            acc_label = f"! HARD ACCIDENT #{vids_tag} [{acc.get('confidence', '90%')}]"
-            text_size = cv2.getTextSize(acc_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
-            label_y = (ay1 - 8) if ay1 > 28 else (ay1 + text_size[1] + 10)
-            label_x = max(4, min(ax1, w - text_size[0] - 12))
-            cv2.rectangle(processed, (label_x - 2, label_y - text_size[1] - 4), (label_x + text_size[0] + 6, label_y + 4), (0, 0, 200), -1)
-            cv2.rectangle(processed, (label_x - 2, label_y - text_size[1] - 4), (label_x + text_size[0] + 6, label_y + 4), (255, 255, 255), 1)
-            cv2.putText(processed, acc_label, (label_x + 2, label_y - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # Highlight suspicious traffic activity if no confirmed accident
-        if not accidents and suspicious_events:
-            for susp in suspicious_events:
-                sx1, sy1, sx2, sy2 = susp["bbox"]
-                sx1, sy1 = max(0, int(sx1)), max(0, int(sy1))
-                sx2, sy2 = min(w - 1, int(sx2)), min(h - 1, int(sy2))
-                cv2.rectangle(processed, (sx1, sy1), (sx2, sy2), (0, 200, 255), 2)
-                cv2.putText(processed, f"VERIFYING: {susp['type']}", (sx1, max(sy1 - 6, 18)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
-
-        # Centered, compact top banner when accident is confirmed
-        if accidents:
-            banner_w = 340
-            bx1 = max(10, w // 2 - banner_w // 2)
-            bx2 = min(w - 10, bx1 + banner_w)
-            cv2.rectangle(processed, (bx1, 8), (bx2, 42), (0, 0, 200), -1)
-            cv2.rectangle(processed, (bx1, 8), (bx2, 42), (255, 255, 255), 2)
-            cv2.putText(processed, "!!! HARD ACCIDENT DETECTED !!!", (bx1 + 18, 31),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        sev = accidents[0].get("severity", "HIGH")
+        banner_w = 380
+        bx1 = max(10, w // 2 - banner_w // 2)
+        bx2 = min(w - 10, bx1 + banner_w)
+        cv2.rectangle(processed, (bx1, 8), (bx2, 42), (0, 0, 200), -1)
+        cv2.rectangle(processed, (bx1, 8), (bx2, 42), (255, 255, 255), 2)
+        cv2.putText(processed, f"!!! HARD ACCIDENT [{sev}] DETECTED !!!", (bx1 + 12, 31),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
     density_info = {
         "density_level": density_level,
@@ -677,75 +784,80 @@ def get_accident_audio_and_notification_script(
     incident_id: str = "ACC-0001",
     vehicle_ids: str = "",
 ) -> str:
-    """Generate inline Web Audio API emergency siren and HTML5 Browser Push Notification (Guaranteed ONCE per incident)."""
-    loc_clean = str(location).replace("'", "\\'").replace('"', '\\"')
-    inc_clean = str(incident_id).replace("'", "\\'").replace('"', '\\"')
-    vids_clean = str(vehicle_ids).replace("'", "\\'").replace('"', '\\"')
-    notif_body = (
-        f"🚨 TRAFFIC ACCIDENT DETECTED! Camera: {loc_clean} Location: {loc_clean} Time: {time_str} "
-        f"Incident ID: {inc_clean} Vehicles Involved: Vehicle #{vids_clean} Confidence: {confidence} "
-        f"Status: UNRESOLVED. Immediate attention required."
-    )
-    return f"""
-    <div id="accident-audio-trigger-{inc_clean}" style="display:none;"></div>
-    <script>
-    (function() {{
-        // Persistent client-side deduplication guard: fire only once per incident ID
-        window.__atcc_notified_incidents = window.__atcc_notified_incidents || new Set();
-        if (window.__atcc_notified_incidents.has('{inc_clean}')) {{
-            return;
-        }}
-        window.__atcc_notified_incidents.add('{inc_clean}');
+    """HTML+JS for a loud, unmissable accident alert (siren, voice, flashing banner,
+    browser notification). Must be rendered with streamlit.components.v1.html so the
+    script actually runs (st.markdown does NOT execute <script>). Fires once per incident."""
+    import json as _json
+    cfg = _json.dumps({
+        "loc": str(location), "time": str(time_str), "conf": str(confidence),
+        "inc": str(incident_id), "vids": str(vehicle_ids),
+    })
+    return """
+<script>
+(function() {
+  var C = __CFG__;
+  var top = window.parent || window;
+  try { top.__atcc_seen = top.__atcc_seen || {}; } catch(e) { top = window; top.__atcc_seen = top.__atcc_seen || {}; }
+  if (top.__atcc_seen[C.inc]) return;          // once per incident
+  top.__atcc_seen[C.inc] = true;
 
-        // 1. Play Warning Sound via Web Audio API (European emergency siren pulse: 960Hz / 600Hz)
-        try {{
-            var AudioContext = window.AudioContext || window.webkitAudioContext;
-            if (AudioContext) {{
-                var ctx = new AudioContext();
-                var now = ctx.currentTime;
-                var osc = ctx.createOscillator();
-                var gain = ctx.createGain();
-                osc.type = 'sawtooth';
-                
-                // Siren tones (dual-frequency emergency sweep)
-                osc.frequency.setValueAtTime(960, now);
-                osc.frequency.setValueAtTime(600, now + 0.22);
-                osc.frequency.setValueAtTime(960, now + 0.44);
-                osc.frequency.setValueAtTime(600, now + 0.66);
-                osc.frequency.setValueAtTime(960, now + 0.88);
-                
-                gain.gain.setValueAtTime(0.35, now);
-                gain.gain.exponentialRampToValueAtTime(0.01, now + 1.15);
-                
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.start(now);
-                osc.stop(now + 1.15);
-            }}
-        }} catch(e) {{
-            console.log('Audio alert notice:', e);
-        }}
+  // 1) Loud siren (3 sweeps, ~3.5 s)
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AC(); if (ctx.state === 'suspended') ctx.resume();
+    var t0 = ctx.currentTime, osc = ctx.createOscillator(), g = ctx.createGain();
+    osc.type = 'square';
+    for (var i = 0; i < 8; i++) osc.frequency.setValueAtTime(i % 2 ? 640 : 980, t0 + i * 0.45);
+    g.gain.setValueAtTime(0.5, t0);
+    g.gain.setValueAtTime(0.5, t0 + 3.4);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 3.6);
+    osc.connect(g); g.connect(ctx.destination); osc.start(t0); osc.stop(t0 + 3.6);
+  } catch(e) { console.log('siren blocked', e); }
 
-        // 2. Trigger native Browser Push Notification if permission granted
-        try {{
-            if ('Notification' in window) {{
-                var notifTitle = '🚨 TRAFFIC ACCIDENT DETECTED!';
-                var notifBody = '{notif_body}';
-                if (Notification.permission === 'granted') {{
-                    new Notification(notifTitle, {{
-                        body: notifBody,
-                        icon: 'https://cdn-icons-png.flaticon.com/512/564/564619.png'
-                    }});
-                }} else if (Notification.permission !== 'denied') {{
-                    Notification.requestPermission();
-                }}
-            }}
-        }} catch(e) {{
-            console.log('Browser notification notice:', e);
-        }}
-    }})();
-    </script>
-    """
+  // 2) Voice warning
+  try {
+    var u = new SpeechSynthesisUtterance('Warning. Accident detected at ' + C.loc + '.');
+    u.rate = 0.95; u.volume = 1; u.lang = 'en-US';
+    (top.speechSynthesis || window.speechSynthesis).speak(u);
+  } catch(e) {}
+
+  // 3) Full-width flashing banner on the main page
+  try {
+    var doc = top.document;
+    var old = doc.getElementById('atcc-alert'); if (old) old.remove();
+    if (!doc.getElementById('atcc-alert-css')) {
+      var st = doc.createElement('style'); st.id = 'atcc-alert-css';
+      st.textContent = '@keyframes atccflash{0%,100%{background:#b00000}50%{background:#ff1a1a}}' +
+        '#atcc-alert{position:fixed;top:0;left:0;right:0;z-index:2147483647;color:#fff;' +
+        'font:700 20px/1.4 sans-serif;padding:18px 24px;text-align:center;' +
+        'animation:atccflash .5s infinite;box-shadow:0 6px 30px rgba(0,0,0,.6)}' +
+        '#atcc-alert button{margin-left:18px;padding:6px 14px;font-weight:700;cursor:pointer;border:0;border-radius:6px}';
+      doc.head.appendChild(st);
+    }
+    var bar = doc.createElement('div'); bar.id = 'atcc-alert';
+    bar.innerHTML = '🚨 ACCIDENT DETECTED — ' + C.loc + ' | ' + C.time + ' | Vehicles #' + C.vids +
+                    ' | ' + C.conf + ' <button id="atcc-dismiss">DISMISS</button>';
+    doc.body.appendChild(bar);
+    doc.getElementById('atcc-dismiss').onclick = function(){ bar.remove(); };
+    setTimeout(function(){ if (bar.parentNode) bar.remove(); }, 15000);
+  } catch(e) { console.log('banner failed', e); }
+
+  // 4) Tab title flash + browser notification
+  try {
+    var d = top.document, orig = d.title, n = 0;
+    var iv = setInterval(function(){ d.title = (n++ % 2) ? orig : '🚨 ACCIDENT DETECTED'; if (n > 20) { clearInterval(iv); d.title = orig; } }, 600);
+  } catch(e) {}
+  try {
+    if ('Notification' in top) {
+      var show = function(){ new top.Notification('🚨 TRAFFIC ACCIDENT DETECTED!',
+        { body: C.loc + ' | ' + C.time + ' | ' + C.inc + ' | Vehicles #' + C.vids, requireInteraction: true }); };
+      if (top.Notification.permission === 'granted') show();
+      else if (top.Notification.permission !== 'denied') top.Notification.requestPermission().then(function(p){ if (p === 'granted') show(); });
+    }
+  } catch(e) {}
+})();
+</script>
+""".replace("__CFG__", cfg)
 
 
 def process_video(
@@ -790,7 +902,16 @@ def process_video(
 
     tracker = VehicleTracker()
     signal_manager = TrafficSignalManager()
-    accident_detector = AccidentDetector()
+    def _new_accident_detector():
+        return AccidentDetector(
+            sensitivity=st.session_state.get("accident_sensitivity", "Balanced"),
+            road_type=ROAD_TYPE_MODES.get(st.session_state.get("road_type_mode", "Auto-detect"), "UNKNOWN"),
+        )
+
+    accident_detector = _new_accident_detector()
+    scene_idx = 0
+    cut_detector = None
+    scene_notice_until = 0
 
     frame_count = 0
     last_save = datetime.now()
@@ -814,6 +935,24 @@ def process_video(
                 continue
             break
         frame_count += 1
+
+        # Resolution-independent processing (see PROCESS_MAX_WIDTH)
+        if PROCESS_MAX_WIDTH and frame.shape[1] > PROCESS_MAX_WIDTH:
+            scale = PROCESS_MAX_WIDTH / float(frame.shape[1])
+            frame = cv2.resize(frame, (PROCESS_MAX_WIDTH, int(round(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+
+        # Camera switch / stream reconnect: old tracks, trajectories and incidents must not carry over
+        if cut_detector is None:
+            _fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            cut_detector = SceneCutDetector(fps=_fps if _fps > 1 else 25.0, stride=max(1, int(frame_stride)))
+        if cut_detector.update(frame):
+            scene_idx += 1
+            tracker = VehicleTracker()
+            signal_manager = TrafficSignalManager()
+            accident_detector = _new_accident_detector()
+            accident_alert_placeholder.empty()
+            accident_alert_active = False
+            scene_notice_until = frame_count + 60
 
         run_inference = (frame_count == 1) or (frame_count % frame_stride == 0)
 
@@ -853,13 +992,30 @@ def process_video(
             acc_type = acc.get("type", "Vehicle Collision")
             conf_str = acc.get("confidence", "92%")
             conf_pct = acc.get("confidence_pct", 92)
+            severity = acc.get("severity", "HIGH")
+            damage_dict = acc.get("damage_assessment", {})
             cand_key = acc.get("incident_key", f"coll_{vids}")
             evidence = acc.get("evidence", {})
             evidence_str = " | ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in evidence.items()) if evidence else f"Confidence: {conf_str}"
 
+            # Format vehicle damage details
+            dmg_html_list = []
+            for v_id, d_data in damage_dict.items():
+                if d_data.get("damage_detected"):
+                    dmg_html_list.append(
+                        f"🔹 <b>Vehicle #{v_id} ({d_data.get('vehicle_class', 'vehicle')}):</b> {d_data.get('damage_category')} "
+                        f"| {d_data.get('severity_level')} severity (Confidence: {d_data.get('confidence_pct')}%)"
+                    )
+                else:
+                    dmg_html_list.append(
+                        f"🔹 <b>Vehicle #{v_id} ({d_data.get('vehicle_class', 'vehicle')}):</b> {d_data.get('damage_category')}"
+                    )
+            damage_display_html = "<br>".join(dmg_html_list) if dmg_html_list else "Visual inspection completed: no severe structural perimeter distortion detected."
+            damage_summary_str = " | ".join(f"#{v}: {d.get('damage_category')}" for v, d in damage_dict.items())
+
             # Deduplicated Incident Record Management via SQLite
             db_id, canonical_id, is_new_incident = database.save_or_update_accident_event(
-                incident_id=acc.get("incident_id") or cand_key,
+                incident_id=acc.get("incident_id") or f"scene{scene_idx}:{cand_key}",
                 feed_title=feed_title,
                 location=feed_title,
                 confidence=conf_str,
@@ -868,11 +1024,13 @@ def process_video(
                 frame_number=frame_count,
                 accident_type=acc_type,
                 evidence_details=evidence_str,
+                severity=severity,
+                damage_assessment=damage_summary_str,
             )
             acc["incident_id"] = canonical_id
 
             formatted_alert_msg = (
-                f"🚨 TRAFFIC ACCIDENT DETECTED! Camera: {feed_title} | Location: {feed_title} | "
+                f"🚨 TRAFFIC ACCIDENT DETECTED [{severity}]! Camera: {feed_title} | Location: {feed_title} | "
                 f"Time: {time_display} | Incident ID: {canonical_id} | "
                 f"Vehicles Involved: Vehicle #{vids} | Confidence: {conf_str} | Status: UNRESOLVED. "
                 f"Immediate attention required."
@@ -889,7 +1047,10 @@ def process_video(
                     incident_id=canonical_id,
                     vehicle_ids=vids,
                 )
-                audio_notification_placeholder.markdown(audio_script, unsafe_allow_html=True)
+                with audio_notification_placeholder:
+                    components.html(audio_script, height=0)
+
+            sev_badge_color = "#dc3545" if severity in ("CRITICAL", "HIGH") else ("#d39e00" if severity == "MEDIUM" else "#5c5c00")
 
             # 2. Danger Symbol Display & Prominent Responsive Alert Banner
             accident_alert_placeholder.markdown(
@@ -912,9 +1073,14 @@ def process_video(
                                 <span style="font-size:22px; font-weight:900; letter-spacing:0.5px; color:#ffffff;">
                                     HARD ACCIDENT DETECTED
                                 </span>
-                                <span style="background:#dc3545; color:white; padding:3px 12px; border-radius:12px; font-size:12px; font-weight:bold;">
-                                    🔴 DANGER
-                                </span>
+                                <div style="display:flex; gap:6px;">
+                                    <span style="background:{sev_badge_color}; color:white; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:bold;">
+                                        {severity} SEVERITY
+                                    </span>
+                                    <span style="background:#dc3545; color:white; padding:3px 12px; border-radius:12px; font-size:12px; font-weight:bold;">
+                                        🔴 DANGER
+                                    </span>
+                                </div>
                             </div>
                             <div style="font-size:13px; color:#ffcccc; margin-top:4px; display:flex; gap:12px; flex-wrap:wrap;">
                                 <span>📅 <b>Time:</b> {date_time_str}</span>
@@ -924,6 +1090,10 @@ def process_video(
                             </div>
                             <div style="margin-top:8px; background:rgba(0,0,0,0.35); padding:8px 12px; border-radius:6px; font-size:13px; line-height:1.4; border-left:4px solid #ff4d4d; word-break:break-word;">
                                 {formatted_alert_msg}
+                            </div>
+                            <div style="margin-top:8px; background:rgba(10,35,70,0.55); padding:8px 12px; border-radius:6px; font-size:12px; line-height:1.4; border-left:4px solid #38bdf8;">
+                                <div style="color:#7dd3fc; font-weight:bold; margin-bottom:2px;">🔵 VEHICLE DAMAGE ANALYSIS:</div>
+                                <div style="color:#e0f2fe;">{damage_display_html}</div>
                             </div>
                             <div style="margin-top:6px; font-size:12px; color:#ffe6e6; display:flex; gap:12px; flex-wrap:wrap;">
                                 <span>🚗 <b>Vehicles:</b> #{vids}</span>
@@ -1051,8 +1221,18 @@ def process_video(
                 "ROI Vehicle Types": density_info["roi_counts"],
                 "Line Crossing Counts": dict(counts),
                 "Signal Status": signal_status,
+                "Road Condition": accident_detector.road_condition() if accident_detector is not None else None,
+                "Camera Scene #": scene_idx + 1,
+                "Frame Size": f"{processed.shape[1]}x{processed.shape[0]}",
                 "FPS": round(avg_fps, 1),
             })
+            if accident_detector is not None and accident_detector.road_condition()["mismatch"]:
+                _rc = accident_detector.road_condition()
+                status_placeholder.warning(
+                    f"⚠️ Road type is set to {_rc['road_type']} but traffic here behaves like "
+                    f"{_rc['observed_type']} ({_rc['observed_confidence_pct']}% confidence). "
+                    f"Switch 'Road Type' in the sidebar to Auto-detect for correct accident rules."
+                )
 
             if accident_detector is not None:
                 diag_records = accident_detector.get_diagnostics()
@@ -1632,15 +1812,26 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
     with m4:
         st.metric("📋 Total Alerts Logged", total_cnt)
 
-    # Audio Alarm Testing Tool
-    col_tools, _ = st.columns([2, 1])
-    with col_tools:
+    # Audio Alarm Testing & Global Alert Clearance Controls
+    col_tools1, col_tools2 = st.columns([2, 1])
+    with col_tools1:
         if st.button("🔊 Test Warning Siren Audio Alert", key=f"test_audio_{title[:5]}"):
-            st.markdown(
-                get_accident_audio_and_notification_script("Test Location (CCTV)", datetime.now().strftime("%I:%M %p"), "95%"),
-                unsafe_allow_html=True,
+            components.html(
+                get_accident_audio_and_notification_script(
+                    "Test Location (CCTV)", datetime.now().strftime("%I:%M %p"), "95%",
+                    incident_id=f"TEST-{int(time.time())}", vehicle_ids="1,2"),
+                height=0,
             )
             st.success("Test alarm triggered! Emergency warning siren sound played.")
+    with col_tools2:
+        if st.button("🧹 Clear All Active Alerts", key=f"clear_all_btn_{title[:5]}", type="secondary", use_container_width=True):
+            username = current_user.get("username", "Operator")
+            cleared_cnt = database.clear_all_active_accidents(username=username)
+            if "dispatched_notifications" in st.session_state:
+                st.session_state["dispatched_notifications"].clear()
+            st.success(f"Successfully cleared {cleared_cnt} active alerts from dashboard. Historical records and evidence preserved.")
+            time.sleep(0.3)
+            st.rerun()
 
     tab_unresolved, tab_ack, tab_resolved, tab_all = st.tabs([
         f"🔴 Unresolved ({unresolved_cnt})",
@@ -1680,9 +1871,11 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
         last_up = row.get("last_updated") or ts
         conf = row.get("confidence", "90%")
         vids = row.get("vehicle_ids", "N/A")
+        sev = row.get("severity") or "HIGH"
+        dmg_note = row.get("damage_assessment") or ""
         evidence_info = row.get("evidence_details") or "Multi-frame kinetic & temporal verification"
         msg = row.get("alert_message") or (
-            f"🚨 TRAFFIC ACCIDENT DETECTED! Camera: {loc} Location: {loc} Time: {ts} Incident ID: {inc_id} Vehicles Involved: Vehicle #{vids} Confidence: {conf} Status: UNRESOLVED. Immediate attention required."
+            f"🚨 TRAFFIC ACCIDENT DETECTED [{sev}]! Camera: {loc} Location: {loc} Time: {ts} Incident ID: {inc_id} Vehicles Involved: Vehicle #{vids} Confidence: {conf} Status: UNRESOLVED. Immediate attention required."
         )
 
         st.markdown(
@@ -1706,6 +1899,7 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
                         <div>
                             <span style="font-size:16px; font-weight:800; color:#1e293b;">{acc_type}</span>
                             <span style="margin-left:8px; background:rgba(0,0,0,0.06); padding:2px 8px; border-radius:6px; font-weight:bold; font-size:12px; color:#334155;">{inc_id}</span>
+                            <span style="margin-left:8px; background:{'#dc3545' if sev in ('CRITICAL','HIGH') else '#d39e00'}; color:white; padding:1px 7px; border-radius:4px; font-weight:bold; font-size:11px;">{sev}</span>
                             <span style="margin-left:8px; font-size:12px; color:#64748b;">📅 {ts}</span>
                         </div>
                     </div>
@@ -1716,28 +1910,32 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
                 <div style="margin-top:10px; background:rgba(0,0,0,0.04); padding:10px 14px; border-radius:8px; font-size:13px; color:#0f172a; border-left:3px solid {card_border}; word-break:break-word;">
                     {msg}
                 </div>
+                <div style="margin-top:6px; font-size:12px; color:#0369a1; background:#f0f9ff; padding:6px 10px; border-radius:6px; border-left:3px solid #0284c7;">
+                    🔵 <b>Damage Status:</b> {dmg_note if dmg_note else 'UNKNOWN (Unable to Verify)'}
+                </div>
                 <div style="margin-top:8px; font-size:12px; color:#475569; display:flex; gap:14px; flex-wrap:wrap;">
-                    <span>📍 <b>Camera / Feed:</b> {loc}</span>
-                    <span>🎯 <b>Confidence:</b> <b>{conf}</b></span>
+                    <span>📍 <b>Camera:</b> {loc}</span>
+                    <span>🗺️ <b>Location:</b> {row.get('location') or loc}</span>
+                    <span>🎯 <b>Collision Confidence:</b> <b>{conf}</b></span>
                     <span>🚗 <b>Vehicles:</b> #{vids}</span>
                     <span>🎞️ <b>Frame:</b> #{row.get('frame_number', 0)}</span>
                     <span>🕒 <b>Last Observed:</b> {last_up}</span>
                 </div>
-                <div style="margin-top:6px; font-size:11px; color:#64748b; background:rgba(0,0,0,0.02); padding:4px 8px; border-radius:4px;">
-                    📊 <b>Verified Evidence:</b> {evidence_info}
+                <div style="margin-top:6px; font-size:11px; color:#64748b; background:rgba(0,0,0,0.02); padding:5px 8px; border-radius:4px;">
+                    📊 <b>Collision Evidence:</b> {evidence_info}
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # Action Buttons
-        btn_col1, btn_col2, btn_col3, _ = st.columns([1.5, 1.5, 1.2, 3])
+        # Action Buttons (Acknowledge, Resolve, Individual Dismissal, Clear)
+        btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1.5, 1.5, 1.4, 1.2])
         username = current_user.get("username", "Operator")
 
         if not resolved and not acknowledged:
             with btn_col1:
-                if st.button("👁️ Acknowledge Alert", key=f"ack_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
+                if st.button("👁️ Acknowledge", key=f"ack_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
                     database.acknowledge_accident_event(a_id, username=username)
                     st.success(f"Alert #{a_id} acknowledged by {username}.")
                     time.sleep(0.3)
@@ -1746,6 +1944,12 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
                 if st.button("✅ Confirm & Resolve", key=f"res_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
                     database.resolve_accident_event(a_id, username=username)
                     st.success(f"Alert #{a_id} marked resolved by {username}.")
+                    time.sleep(0.3)
+                    st.rerun()
+            with btn_col3:
+                if st.button("❌ Dismiss Alert", key=f"dism_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
+                    database.dismiss_accident_event(a_id, username=username)
+                    st.info(f"Alert #{a_id} dismissed from active view (evidence preserved in history).")
                     time.sleep(0.3)
                     st.rerun()
 
@@ -1758,16 +1962,22 @@ def render_accident_alert_history_panel(current_user: dict, title: str = "🚨 A
                     st.success(f"Alert #{a_id} marked resolved by {username}.")
                     time.sleep(0.3)
                     st.rerun()
+            with btn_col3:
+                if st.button("❌ Dismiss Alert", key=f"dism2_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
+                    database.dismiss_accident_event(a_id, username=username)
+                    st.info(f"Alert #{a_id} dismissed from active view (evidence preserved in history).")
+                    time.sleep(0.3)
+                    st.rerun()
 
         else:
             with btn_col1:
-                st.caption(f"Resolved by: `{row.get('resolved_by') or 'Operator'}`")
+                st.caption(f"Status: `{status.upper()}` by `{row.get('resolved_by') or row.get('acknowledged_by') or 'Operator'}`")
 
         if auth.is_admin(current_user):
-            with btn_col3:
-                if st.button("🗑️ Clear", key=f"clr_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
-                    database.clear_accident_event(a_id)
-                    st.warning(f"Alert #{a_id} cleared from history.")
+            with btn_col4:
+                if st.button("🗑️ Clear Record", key=f"clr_{panel_prefix}_{tab_prefix}_{a_id}", use_container_width=True):
+                    database.clear_accident_event(a_id, username=username)
+                    st.warning(f"Alert #{a_id} cleared from active history.")
                     time.sleep(0.3)
                     st.rerun()
 
@@ -2504,6 +2714,21 @@ def main():
         st.sidebar.info("🐢 CPU Mode")
 
     selected_device_key = st.sidebar.selectbox("Inference Device:", options=list(device_map.keys()), index=0)
+    st.sidebar.selectbox(
+        "🚨 Accident Sensitivity:",
+        options=["Strict", "Balanced", "Sensitive"],
+        index=1,
+        key="accident_sensitivity",
+        help="Strict = fewest false alarms (may miss crashes). Sensitive = catches more crashes, more false alarms.",
+    )
+    st.sidebar.selectbox(
+        "🛣️ Road Type:",
+        options=list(ROAD_TYPE_MODES.keys()),
+        index=0,
+        key="road_type_mode",
+        help="Auto-detect learns the road type from how vehicles move (highway = fast straight flow, "
+             "intersection = frequent turns). Picking a type here forces that rule set.",
+    )
     target_device = device_map[selected_device_key]
 
     # Model Selection with Local Availability Detection & Placement Guide

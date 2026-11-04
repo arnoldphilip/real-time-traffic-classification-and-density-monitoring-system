@@ -2,7 +2,7 @@
 import os
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from auth import hash_password, load_config
 
 DB_PATH = "unified_traffic_database.db"
@@ -129,6 +129,9 @@ def init_database(db_path: str = DB_PATH):
         ("feed_id", "INTEGER DEFAULT 0"),
         ("accident_type", "TEXT DEFAULT 'Vehicle Collision'"),
         ("confidence_pct", "INTEGER DEFAULT 90"),
+        ("road_type", "TEXT DEFAULT 'HIGHWAY'"),
+        ("severity", "TEXT DEFAULT 'HIGH'"),
+        ("damage_assessment", "TEXT DEFAULT ''"),
         ("evidence_details", "TEXT"),
         ("alert_message", "TEXT"),
         ("status", "TEXT DEFAULT 'unresolved'"),
@@ -144,6 +147,21 @@ def init_database(db_path: str = DB_PATH):
         if col_name not in existing_cols:
             try:
                 cursor.execute(f"ALTER TABLE AccidentEvents ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass
+
+    # Ensure schema migrations for VideoFeeds
+    cursor.execute("PRAGMA table_info(VideoFeeds)")
+    existing_feed_cols = {row[1] for row in cursor.fetchall()}
+    feed_cols_to_add = [
+        ("road_type", "TEXT DEFAULT 'HIGHWAY'"),
+        ("roi_polygon", "TEXT DEFAULT ''"),
+        ("exclusion_zones", "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_def in feed_cols_to_add:
+        if col_name not in existing_feed_cols:
+            try:
+                cursor.execute(f"ALTER TABLE VideoFeeds ADD COLUMN {col_name} {col_def}")
             except Exception:
                 pass
 
@@ -430,10 +448,20 @@ def get_video_feed_by_id(video_id: int, current_user: dict) -> dict | None:
     return feed
 
 
-def add_video_feed(title: str, video_url: str, current_user: dict, loop: bool = True, status: str = "active", target_user_id: int = None) -> tuple[bool, str, int | None]:
+def add_video_feed(
+    title: str,
+    video_url: str,
+    current_user: dict,
+    loop: bool = True,
+    status: str = "active",
+    target_user_id: int = None,
+    road_type: str = "HIGHWAY",
+    roi_polygon: str = "",
+    exclusion_zones: str = "",
+) -> tuple[bool, str, int | None]:
     """
-    Add a new video feed.
-    - Standard user always assigns feed to their own user_id (cannot assign to others).
+    Add a new video feed with road classification and zone configurations.
+    - Standard user always assigns feed to their own user_id.
     - Admin can assign feed to self or optionally specify target_user_id.
     """
     if not current_user:
@@ -453,15 +481,31 @@ def add_video_feed(title: str, video_url: str, current_user: dict, loop: bool = 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cursor.execute("""
-        INSERT INTO VideoFeeds (user_id, title, video_url, status, loop, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (assigned_user_id, title, video_url, status, 1 if loop else 0, now_str))
+        INSERT INTO VideoFeeds (user_id, title, video_url, status, loop, created_at, road_type, roi_polygon, exclusion_zones)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (assigned_user_id, title, video_url, status, 1 if loop else 0, now_str, road_type, roi_polygon, exclusion_zones))
     new_id = cursor.lastrowid
 
-    log_activity_internal(cursor, current_user["id"], current_user["username"], "ADD_FEED", f"Added video feed '{title}' (ID: {new_id}, Owner: {assigned_user_id})")
+    log_activity_internal(cursor, current_user["id"], current_user["username"], "ADD_FEED", f"Added video feed '{title}' [{road_type}] (ID: {new_id}, Owner: {assigned_user_id})")
     conn.commit()
     conn.close()
     return True, f"Video feed '{title}' added successfully.", new_id
+
+
+def update_video_feed_road_config(video_id: int, road_type: str, roi_polygon: str = "", exclusion_zones: str = "") -> bool:
+    """Update road type and polygon zones for a specific video feed."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE VideoFeeds
+        SET road_type = ?,
+            roi_polygon = coalesce(nullif(?, ''), roi_polygon),
+            exclusion_zones = coalesce(nullif(?, ''), exclusion_zones)
+        WHERE id = ?
+    """, (road_type, roi_polygon, exclusion_zones, video_id))
+    conn.commit()
+    conn.close()
+    return True
 
 
 def pause_video_feed(video_id: int, current_user: dict) -> tuple[bool, str]:
@@ -683,6 +727,9 @@ def save_or_update_accident_event(
     evidence_details: str = "",
     confidence_pct: int = 90,
     feed_id: int = 0,
+    severity: str = "HIGH",
+    damage_assessment: str = "",
+    road_type: str = "HIGHWAY",
 ) -> tuple[int, str, bool]:
     """
     Save a new accident incident or update an existing incident across consecutive frames.
@@ -703,14 +750,25 @@ def save_or_update_accident_event(
         cursor.execute("SELECT id, incident_id, status, resolved, acknowledged FROM AccidentEvents WHERE incident_id = ?", (incident_id,))
         existing_row = cursor.fetchone()
 
+    # Also check if incident_id key is stored in alert_message or evidence_details
+    if not existing_row and incident_id:
+        cursor.execute(
+            "SELECT id, incident_id, status, resolved, acknowledged FROM AccidentEvents WHERE feed_title = ? AND resolved = 0 AND (alert_message LIKE ? OR evidence_details LIKE ?) ORDER BY id DESC LIMIT 1",
+            (feed_title, f"%{incident_id}%", f"%{incident_id}%")
+        )
+        existing_row = cursor.fetchone()
+
     # If no match by incident_id, check for active un-resolved incident on same feed with overlapping vehicles within 180s
-    if not existing_row and vehicle_ids:
+    # Fallback match by overlapping vehicle IDs: only when the caller gave NO incident key, and only
+    # within 180 s. Tracker IDs restart on every camera/scene change, so matching on IDs alone would
+    # silently merge a NEW accident into an old one and suppress its alert.
+    if not existing_row and vehicle_ids and not incident_id:
         cursor.execute("""
             SELECT id, incident_id, status, resolved, acknowledged, vehicle_ids, timestamp
             FROM AccidentEvents
-            WHERE feed_title = ? AND resolved = 0
+            WHERE feed_title = ? AND resolved = 0 AND COALESCE(last_updated, timestamp) >= ?
             ORDER BY id DESC LIMIT 5
-        """, (feed_title,))
+        """, (feed_title, (now_dt - timedelta(seconds=180)).strftime("%Y-%m-%d %H:%M:%S")))
         active_candidates = cursor.fetchall()
         in_vids = {v.strip() for v in str(vehicle_ids).replace("#", "").split(",") if v.strip()}
         for cand in active_candidates:
@@ -729,10 +787,13 @@ def save_or_update_accident_event(
                 frame_number = ?,
                 confidence = ?,
                 confidence_pct = ?,
+                severity = coalesce(nullif(?, ''), severity),
+                damage_assessment = coalesce(nullif(?, ''), damage_assessment),
+                road_type = coalesce(nullif(?, ''), road_type),
                 evidence_details = coalesce(nullif(?, ''), evidence_details),
                 alert_message = coalesce(nullif(?, ''), alert_message)
             WHERE id = ?
-        """, (now_str, frame_number, confidence, confidence_pct, evidence_details, alert_message, event_id))
+        """, (now_str, frame_number, confidence, confidence_pct, severity, damage_assessment, road_type, evidence_details, alert_message, event_id))
         conn.commit()
         conn.close()
         return event_id, canonical_id, False
@@ -741,12 +802,13 @@ def save_or_update_accident_event(
     cursor.execute("SELECT MAX(id) FROM AccidentEvents")
     max_res = cursor.fetchone()[0]
     next_num = (max_res or 0) + 1
-    canonical_id = incident_id if (incident_id and not incident_id.startswith(("pair_", "single_", "cand_"))) else f"ACC-{next_num:04d}"
+    # Only a real ACC-xxxx id is kept; detector keys (pair_/single_/wreck_/scene prefixes) are references.
+    canonical_id = incident_id if (incident_id and str(incident_id).startswith("ACC-")) else f"ACC-{next_num:04d}"
 
     if not alert_message:
         alert_message = (
-            f"🚨 TRAFFIC ACCIDENT DETECTED! Camera: {feed_title} | Location: {location} | "
-            f"Time: {time_display} | Incident ID: {canonical_id} | "
+            f"🚨 TRAFFIC ACCIDENT DETECTED [{severity} - {road_type}]! Camera: {feed_title} | Location: {location} | "
+            f"Time: {time_display} | Incident ID: {canonical_id} | Ref: {incident_id or ''} | "
             f"Vehicles Involved: #{vehicle_ids} | Confidence: {confidence} | Status: UNRESOLVED. "
             f"Immediate attention required."
         )
@@ -754,10 +816,10 @@ def save_or_update_accident_event(
     cursor.execute("""
         INSERT INTO AccidentEvents (
             incident_id, timestamp, last_updated, feed_id, feed_title, location,
-            accident_type, confidence, confidence_pct, vehicle_ids, frame_number,
-            alert_message, evidence_details, status, resolved, acknowledged, notification_sent
+            accident_type, confidence, confidence_pct, severity, damage_assessment, road_type,
+            vehicle_ids, frame_number, alert_message, evidence_details, status, resolved, acknowledged, notification_sent
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unresolved', 0, 0, 1)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unresolved', 0, 0, 1)
     """, (
         canonical_id,
         now_str,
@@ -768,6 +830,9 @@ def save_or_update_accident_event(
         accident_type,
         confidence,
         confidence_pct,
+        severity,
+        damage_assessment,
+        road_type,
         vehicle_ids,
         frame_number,
         alert_message,
@@ -804,15 +869,24 @@ def save_accident_event(
 
 
 def get_recent_accident_events(limit: int = 50, status_filter: str = "all") -> list:
-    """Retrieve the most recent accident events from the database."""
+    """Retrieve accident events from database with status filtering (preserving historical records)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     if status_filter == "unresolved":
-        cursor.execute("SELECT * FROM AccidentEvents WHERE resolved = 0 AND acknowledged = 0 ORDER BY id DESC LIMIT ?", (limit,))
+        cursor.execute(
+            "SELECT * FROM AccidentEvents WHERE resolved = 0 AND acknowledged = 0 AND status NOT IN ('cleared', 'dismissed', 'resolved') ORDER BY id DESC LIMIT ?",
+            (limit,)
+        )
     elif status_filter == "acknowledged":
-        cursor.execute("SELECT * FROM AccidentEvents WHERE acknowledged = 1 AND resolved = 0 ORDER BY id DESC LIMIT ?", (limit,))
+        cursor.execute(
+            "SELECT * FROM AccidentEvents WHERE acknowledged = 1 AND resolved = 0 AND status NOT IN ('cleared', 'dismissed', 'resolved') ORDER BY id DESC LIMIT ?",
+            (limit,)
+        )
     elif status_filter == "resolved":
-        cursor.execute("SELECT * FROM AccidentEvents WHERE resolved = 1 ORDER BY id DESC LIMIT ?", (limit,))
+        cursor.execute(
+            "SELECT * FROM AccidentEvents WHERE (resolved = 1 OR status IN ('cleared', 'dismissed', 'resolved')) ORDER BY id DESC LIMIT ?",
+            (limit,)
+        )
     else:
         cursor.execute("SELECT * FROM AccidentEvents ORDER BY id DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()
@@ -848,35 +922,111 @@ def resolve_accident_event(event_id, username: str = "Operator"):
     conn.close()
 
 
-def clear_accident_event(event_id):
-    """Delete an accident event record from history."""
+def dismiss_accident_event(event_id, username: str = "Operator") -> bool:
+    """Dismiss an individual active alert from dashboard while safely preserving evidence in database."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM AccidentEvents WHERE id = ? OR incident_id = ?", (event_id, str(event_id)))
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE AccidentEvents
+        SET resolved = 1, status = 'dismissed', resolved_by = ?, resolved_at = ?
+        WHERE id = ? OR incident_id = ?
+    """, (username, now_str, event_id, str(event_id)))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+
+def clear_all_active_accidents(username: str = "Operator") -> int:
+    """Clear all active/unresolved accident alerts from the dashboard while preserving all historical records in database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE AccidentEvents
+        SET resolved = 1, status = 'cleared', resolved_by = ?, resolved_at = ?
+        WHERE resolved = 0 OR status IN ('unresolved', 'acknowledged')
+    """, (username, now_str))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected
+
+
+def clear_accident_event(event_id, username: str = "Operator", hard_delete: bool = False):
+    """Clear an accident event. Defaults to soft-clear (retaining evidence in history) unless hard_delete is requested."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if hard_delete:
+        cursor.execute("DELETE FROM AccidentEvents WHERE id = ? OR incident_id = ?", (event_id, str(event_id)))
+    else:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            UPDATE AccidentEvents
+            SET resolved = 1, status = 'cleared', resolved_by = ?, resolved_at = ?
+            WHERE id = ? OR incident_id = ?
+        """, (username, now_str, event_id, str(event_id)))
     conn.commit()
     conn.close()
 
 
-def get_system_accident_summary() -> dict:
+# An accident only counts as "live" if the detector updated it this recently.
+# Detector refreshes `last_updated` every frame while a video/stream is running,
+# so once processing stops, old rows stop triggering the DANGER/WARNING banner.
+LIVE_ACCIDENT_WINDOW_SEC = 30
+
+
+def expire_stale_accident_events(max_age_sec: int = LIVE_ACCIDENT_WINDOW_SEC) -> int:
+    """Auto-close unresolved accident rows left over from earlier sessions.
+    Call once at app start. Returns the number of rows closed."""
+    cutoff = (datetime.now() - timedelta(seconds=max_age_sec)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE AccidentEvents SET resolved = 1, status = 'expired' "
+            "WHERE resolved = 0 AND COALESCE(last_updated, timestamp) < ?",
+            (cutoff,),
+        )
+        n = cur.rowcount
+        conn.commit()
+        return n
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+def get_system_accident_summary(feed_title: str = None) -> dict:
     """
-    Compute current overall system accident status:
-    - 🔴 DANGER: Any unresolved accident exists (resolved=0 AND acknowledged=0)
-    - 🟡 WARNING: Acknowledged accident under investigation (acknowledged=1 AND resolved=0)
-    - 🟢 NORMAL: All events resolved (or zero events)
+    Current LIVE accident status (optionally scoped to one feed_title):
+    - DANGER : unresolved accident updated within LIVE_ACCIDENT_WINDOW_SEC
+    - WARNING: acknowledged accident updated within the same window
+    - NORMAL : nothing live (no video running / no detection)
+    Resolved count is a lifetime total; history lives in the Alert History panel.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
+    feed_filter = " AND feed_title = ?" if feed_title else ""
+    cutoff = (datetime.now() - timedelta(seconds=LIVE_ACCIDENT_WINDOW_SEC)).strftime("%Y-%m-%d %H:%M:%S")
+    live = " AND COALESCE(last_updated, timestamp) >= ?"
+    live_params = (cutoff, feed_title) if feed_title else (cutoff,)
+    feed_params = (feed_title,) if feed_title else ()
     try:
-        cursor.execute("SELECT COUNT(*) FROM AccidentEvents WHERE resolved = 0 AND acknowledged = 0")
+        cursor.execute(f"SELECT COUNT(*) FROM AccidentEvents WHERE resolved = 0 AND acknowledged = 0 AND status NOT IN ('cleared', 'dismissed', 'resolved'){live}{feed_filter}", live_params)
         unresolved_count = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM AccidentEvents WHERE acknowledged = 1 AND resolved = 0")
+        cursor.execute(f"SELECT COUNT(*) FROM AccidentEvents WHERE acknowledged = 1 AND resolved = 0 AND status NOT IN ('cleared', 'dismissed', 'resolved'){live}{feed_filter}", live_params)
         acknowledged_count = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM AccidentEvents WHERE resolved = 1")
+        cursor.execute(f"SELECT COUNT(*) FROM AccidentEvents WHERE (resolved = 1 OR status IN ('cleared', 'dismissed', 'resolved')){feed_filter}", feed_params)
         resolved_count = cursor.fetchone()[0]
 
-        cursor.execute("SELECT * FROM AccidentEvents ORDER BY id DESC LIMIT 1")
+        if feed_title:
+            cursor.execute("SELECT * FROM AccidentEvents WHERE feed_title = ? ORDER BY id DESC LIMIT 1", (feed_title,))
+        else:
+            cursor.execute("SELECT * FROM AccidentEvents ORDER BY id DESC LIMIT 1")
         row = cursor.fetchone()
         latest_event = dict(row) if row else None
     except Exception:
@@ -1007,4 +1157,3 @@ def deactivate_agent(agent_id: str) -> bool:
         return False
     finally:
         conn.close()
-

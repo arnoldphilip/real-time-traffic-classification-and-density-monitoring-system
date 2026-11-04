@@ -35,7 +35,7 @@ def setup_clean_db():
     database.init_database()
     conn = database.get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM AccidentEvents")
+    c.execute("DELETE FROM AccidentEvents WHERE feed_title = 'Highway CCTV Cam 01'")
     conn.commit()
     conn.close()
 
@@ -240,8 +240,8 @@ def test_9_deduplication_and_100_frame_persistence(acc_event):
             assert db_id == first_db_id, f"Frame {f}: Created duplicate DB record #{db_id}!"
             assert canonical_id == first_canonical_id
 
-    # Verify database table has exactly 1 record
-    all_events = database.get_recent_accident_events(limit=50)
+    # Verify database table has exactly 1 record for this feed
+    all_events = [e for e in database.get_recent_accident_events(limit=50) if e.get("feed_title") == "Highway CCTV Cam 01"]
     assert len(all_events) == 1, f"Expected exactly 1 DB record, found {len(all_events)}"
     assert notification_count == 1, f"Expected 1 notification trigger, got {notification_count}"
     print(f"  [PASS] 100 consecutive frames produced exactly 1 DB record ({first_canonical_id}) and 1 notification.")

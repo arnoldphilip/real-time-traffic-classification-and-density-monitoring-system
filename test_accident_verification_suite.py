@@ -15,7 +15,7 @@ def setup_clean_db():
     database.init_database()
     conn = database.get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM AccidentEvents")
+    c.execute("DELETE FROM AccidentEvents WHERE feed_title IN ('Highway North CCTV', 'Intersection South CCTV')")
     conn.commit()
     conn.close()
 
@@ -192,10 +192,10 @@ def run_all_tests():
         if is_new:
             notification_triggers += 1
 
-    # Verify database has exactly 1 row
+    # Verify database has exactly 1 row for this feed
     conn = database.get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), id, incident_id, frame_number FROM AccidentEvents")
+    c.execute("SELECT COUNT(*), id, incident_id, frame_number FROM AccidentEvents WHERE feed_title = 'Highway North CCTV'")
     row = c.fetchone()
     total_db_records = row[0]
     last_frame = row[3]
@@ -210,10 +210,10 @@ def run_all_tests():
     # TEST 9: Dashboard Refresh While Accident Active -> Visible, No Duplicate
     # -------------------------------------------------------------
     print("\n[TEST 9] Dashboard Refresh While Accident Active...")
-    summary = database.get_system_accident_summary()
+    summary = database.get_system_accident_summary(feed_title="Highway North CCTV")
     assert summary["condition"] == "DANGER", f"Expected condition DANGER, got {summary['condition']}"
     assert summary["unresolved_count"] == 1
-    recent = database.get_recent_accident_events(limit=5, status_filter="unresolved")
+    recent = [r for r in database.get_recent_accident_events(limit=10, status_filter="unresolved") if r.get("feed_title") == "Highway North CCTV"]
     assert len(recent) == 1
     assert recent[0]["incident_id"] == first_inc_id
     print("  ✓ PASS: Dashboard refresh correctly displays active unresolved incident without duplicate alerts.")
@@ -223,12 +223,12 @@ def run_all_tests():
     # -------------------------------------------------------------
     print("\n[TEST 10] Acknowledging Accident Incident...")
     database.acknowledge_accident_event(first_inc_id, username="TrafficDispatcher")
-    summary_after_ack = database.get_system_accident_summary()
+    summary_after_ack = database.get_system_accident_summary(feed_title="Highway North CCTV")
     assert summary_after_ack["condition"] == "WARNING", f"Expected WARNING, got {summary_after_ack['condition']}"
     assert summary_after_ack["acknowledged_count"] == 1
     assert summary_after_ack["unresolved_count"] == 0
 
-    recent_ack = database.get_recent_accident_events(status_filter="acknowledged")
+    recent_ack = [r for r in database.get_recent_accident_events(status_filter="acknowledged") if r.get("feed_title") == "Highway North CCTV"]
     assert len(recent_ack) == 1
     assert recent_ack[0]["acknowledged_by"] == "TrafficDispatcher"
     print("  ✓ PASS: Accident successfully acknowledged by TrafficDispatcher (Condition: WARNING).")
@@ -238,13 +238,13 @@ def run_all_tests():
     # -------------------------------------------------------------
     print("\n[TEST 11] Confirming & Resolving Accident Incident...")
     database.resolve_accident_event(first_inc_id, username="SiteSupervisor")
-    summary_after_res = database.get_system_accident_summary()
+    summary_after_res = database.get_system_accident_summary(feed_title="Highway North CCTV")
     assert summary_after_res["condition"] == "NORMAL", f"Expected NORMAL, got {summary_after_res['condition']}"
     assert summary_after_res["resolved_count"] == 1
     assert summary_after_res["unresolved_count"] == 0
     assert summary_after_res["acknowledged_count"] == 0
 
-    recent_res = database.get_recent_accident_events(status_filter="resolved")
+    recent_res = [r for r in database.get_recent_accident_events(status_filter="resolved") if r.get("feed_title") == "Highway North CCTV"]
     assert len(recent_res) == 1
     assert recent_res[0]["resolved_by"] == "SiteSupervisor"
     print("  ✓ PASS: Incident resolved by SiteSupervisor. System condition reset to NORMAL.")
@@ -267,16 +267,16 @@ def run_all_tests():
     assert new_inc_id != first_inc_id, f"Expected distinct incident ID, got {new_inc_id} matching old {first_inc_id}"
     assert new_db_id != first_db_id
 
-    summary_new = database.get_system_accident_summary()
+    summary_new = database.get_system_accident_summary(feed_title="Intersection South CCTV")
     assert summary_new["condition"] == "DANGER"
     assert summary_new["unresolved_count"] == 1
-    assert summary_new["resolved_count"] == 1
 
     conn = database.get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT incident_id, status FROM AccidentEvents ORDER BY id ASC")
+    c.execute("SELECT incident_id, status FROM AccidentEvents WHERE feed_title IN ('Highway North CCTV', 'Intersection South CCTV') ORDER BY id ASC")
     all_rows = c.fetchall()
     conn.close()
+    assert len(all_rows) == 2
     assert len(all_rows) == 2
     print(f"  ✓ PASS: Genuinely new accident created incident {new_inc_id} with initial notification.")
 

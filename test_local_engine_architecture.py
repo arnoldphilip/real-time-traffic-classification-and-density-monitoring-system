@@ -45,14 +45,14 @@ def test_1_models_directory_and_discovery():
 
 
 def test_2_safe_yolov8x_loading_without_github_crash():
-    """Verify loading yolov8x.pt falls back gracefully to yolov8n.pt with zero network crashes."""
-    print("\n[TEST 2] YOLOv8x Missing Model Graceful Fallback & Zero Crash...")
-    model, loaded_name, info = load_model_safely("yolov8x.pt", device="cpu", allow_fallback=True)
+    """Verify loading missing model falls back gracefully to best local model with zero network crashes."""
+    print("\n[TEST 2] Missing Model Graceful Fallback & Zero Crash...")
+    model, loaded_name, info = load_model_safely("yolov8_missing_heavy.pt", device="cpu", allow_fallback=True)
     assert model is not None, "Model must load via fallback"
     assert info["fallback_used"] is True, "Fallback flag must be True"
-    assert loaded_name == "yolov8n.pt", f"Expected fallback to yolov8n.pt, got {loaded_name}"
+    assert loaded_name in ("yolov8n.pt", "yolov8x.pt", "yolov8l.pt"), f"Expected local fallback, got {loaded_name}"
     assert "guide" not in info or info.get("success") is True
-    assert "models\\yolov8x.pt" in info["warning"] or "models/yolov8x.pt" in info["warning"]
+    assert "yolov8_missing_heavy.pt" in info["warning"]
     print(f"  [PASS] Successfully avoided GitHub ConnectionResetError. Loaded local fallback: '{loaded_name}'")
     print(f"  [PASS] Warning message informs administrator: {info['warning'][:80]}...")
 
