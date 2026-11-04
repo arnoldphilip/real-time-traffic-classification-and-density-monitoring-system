@@ -1,0 +1,12 @@
+streamlit
+opencv-python
+ultralytics
+numpy
+pillow
+torch
+torchvision
+matplotlib
+pandas
+scipy
+bcrypt
+yt-dlp

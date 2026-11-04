@@ -1,0 +1,91 @@
+{
+  "project": "ATCC",
+  "application": "Automatic Traffic Classification and Counting",
+
+  "authentication": {
+    "enabled": true,
+    "login_types": ["admin", "user"],
+    "password_storage": "bcrypt_hash"
+  },
+
+  "admin": {
+    "dashboard": true,
+    "permissions": [
+      "view_all_users",
+      "add_user",
+      "edit_user",
+      "delete_user",
+      "view_all_videos",
+      "add_live_feed",
+      "pause_live_feed",
+      "resume_live_feed",
+      "delete_live_feed",
+      "view_analytics",
+      "manage_database"
+    ]
+  },
+
+  "user": {
+    "dashboard": true,
+    "permissions": [
+      "add_live_feed",
+      "view_own_videos",
+      "pause_own_video",
+      "resume_own_video",
+      "delete_own_video"
+    ],
+    "access": "own_videos_only"
+  },
+
+  "video_settings": {
+    "source_type": "MP4_URL",
+    "autoplay": true,
+    "muted": true,
+    "loop": true,
+    "show_play_button": false,
+    "show_delete_button": false,
+    "hover_menu": {
+      "enabled": true,
+      "icon": "three_dots",
+      "options": [
+        "pause",
+        "resume",
+        "delete"
+      ]
+    }
+  },
+
+  "database": {
+    "type": "SQLite",
+    "file": "unified_traffic_database.db",
+    "tables": [
+      "Users",
+      "VideoFeeds",
+      "VehicleCounts",
+      "TrafficEvents",
+      "ActivityLogs",
+      "AccidentEvents"
+    ]
+  },
+
+  "interface": {
+    "theme": "basic",
+    "sidebar": true,
+    "responsive": true,
+    "admin_dashboard": [
+      "Dashboard",
+      "Live Feeds",
+      "Accident Alerts",
+      "All Videos",
+      "Manage Users",
+      "Analytics",
+      "Settings"
+    ],
+    "user_dashboard": [
+      "My Live Feeds",
+      "Accident Alerts",
+      "Settings"
+    ]
+  }
+}
+
